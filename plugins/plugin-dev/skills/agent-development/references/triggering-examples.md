@@ -18,6 +18,10 @@ assistant: "[How Claude triggers the agent - usually 'I'll use the [agent-name] 
 </example>
 ```
 
+In the agent file this block is part of the `description` value, which must be a `|-` block
+scalar: indent every line of it, `<example>` included, by two spaces (see the Complete Format
+in SKILL.md). Unindented example blocks are a YAML parse error and the agent is not loaded.
+
 ## Anatomy of a Good Example
 
 ### Context

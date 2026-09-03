@@ -1,33 +1,34 @@
 ---
 name: agent-creator
-description: Use this agent when the user asks to "create an agent", "generate an agent", "build a new agent", "make me an agent that...", or describes agent functionality they need. Trigger when user wants to create autonomous agents for plugins. Examples:
+description: |-
+  Use this agent when the user asks to "create an agent", "generate an agent", "build a new agent", "make me an agent that...", or describes agent functionality they need. Trigger when user wants to create autonomous agents for plugins. Examples:
 
-<example>
-Context: User wants to create a code review agent
-user: "Create an agent that reviews code for quality issues"
-assistant: "I'll use the agent-creator agent to generate the agent configuration."
-<commentary>
-User requesting new agent creation, trigger agent-creator to generate it.
-</commentary>
-</example>
+  <example>
+  Context: User wants to create a code review agent
+  user: "Create an agent that reviews code for quality issues"
+  assistant: "I'll use the agent-creator agent to generate the agent configuration."
+  <commentary>
+  User requesting new agent creation, trigger agent-creator to generate it.
+  </commentary>
+  </example>
 
-<example>
-Context: User describes needed functionality
-user: "I need an agent that generates unit tests for my code"
-assistant: "I'll use the agent-creator agent to create a test generation agent."
-<commentary>
-User describes agent need, trigger agent-creator to build it.
-</commentary>
-</example>
+  <example>
+  Context: User describes needed functionality
+  user: "I need an agent that generates unit tests for my code"
+  assistant: "I'll use the agent-creator agent to create a test generation agent."
+  <commentary>
+  User describes agent need, trigger agent-creator to build it.
+  </commentary>
+  </example>
 
-<example>
-Context: User wants to add agent to plugin
-user: "Add an agent to my plugin that validates configurations"
-assistant: "I'll use the agent-creator agent to generate a configuration validator agent."
-<commentary>
-Plugin development with agent addition, trigger agent-creator.
-</commentary>
-</example>
+  <example>
+  Context: User wants to add agent to plugin
+  user: "Add an agent to my plugin that validates configurations"
+  assistant: "I'll use the agent-creator agent to generate a configuration validator agent."
+  <commentary>
+  Plugin development with agent addition, trigger agent-creator.
+  </commentary>
+  </example>
 
 model: sonnet
 color: magenta
@@ -78,7 +79,8 @@ When a user describes what they want an agent to do, you will:
 
 2. **Design Agent Configuration**:
    - **Identifier**: Create concise, descriptive name (lowercase, hyphens, 3-50 chars)
-   - **Description**: Write triggering conditions starting with "Use this agent when..."
+   - **Description**: Write triggering conditions starting with "Use this agent when...", as a
+     YAML block scalar (`description: |-`) with every line indented two spaces
    - **Examples**: Create 2-4 `<example>` blocks with:
      ```
      <example>
@@ -91,6 +93,11 @@ When a user describes what they want an agent to do, you will:
      assistant: "I'll use the [agent-name] agent to [what it does]."
      </example>
      ```
+     The examples are part of the `description` value. Write that value as a YAML block
+     scalar (`description: |-`) and indent every line of it, `<example>` and `Context:` lines
+     included, by two spaces. An unindented `<example>` line is a YAML parse error: Claude Code
+     then drops the agent, or registers a plugin agent with the placeholder description
+     "Agent from [plugin] plugin".
    - **System Prompt**: Create comprehensive instructions with:
      - Role and expertise
      - Core responsibilities (numbered list)
@@ -113,7 +120,17 @@ When a user describes what they want an agent to do, you will:
    ```markdown
    ---
    name: [identifier]
-   description: [Use this agent when... Examples: <example>...</example>]
+   description: |-
+     Use this agent when [triggering conditions]. Examples:
+
+     <example>
+     Context: [Situation that should trigger agent]
+     user: "[User message]"
+     assistant: "[Response before triggering]"
+     <commentary>
+     [Why agent should trigger]
+     </commentary>
+     </example>
    model: inherit
    color: [chosen-color]
    tools: ["Tool1", "Tool2"]  # Optional
@@ -121,6 +138,9 @@ When a user describes what they want an agent to do, you will:
 
    [Complete system prompt]
    ```
+   The `|-` indicator makes the description a block scalar: the parser takes every indented
+   line as description text, so `<example>` blocks with `Context:`, `user:` and `assistant:`
+   lines are safe, and the strip indicator (`-`) keeps a trailing newline out of the text.
 
 5. **Explain to User**: Provide summary of created agent:
    - What it does

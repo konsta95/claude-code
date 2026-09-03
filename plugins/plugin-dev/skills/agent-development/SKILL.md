@@ -24,20 +24,21 @@ Agents are autonomous subprocesses that handle complex, multi-step tasks indepen
 ```markdown
 ---
 name: agent-identifier
-description: Use this agent when [triggering conditions]. Examples:
+description: |-
+  Use this agent when [triggering conditions]. Examples:
 
-<example>
-Context: [Situation description]
-user: "[User request]"
-assistant: "[How assistant should respond and use this agent]"
-<commentary>
-[Why this agent should be triggered]
-</commentary>
-</example>
+  <example>
+  Context: [Situation description]
+  user: "[User request]"
+  assistant: "[How assistant should respond and use this agent]"
+  <commentary>
+  [Why this agent should be triggered]
+  </commentary>
+  </example>
 
-<example>
-[Additional example...]
-</example>
+  <example>
+  [Additional example...]
+  </example>
 
 model: inherit
 color: blue
@@ -83,6 +84,13 @@ Agent identifier used for namespacing and invocation.
 
 Defines when Claude should trigger this agent. **This is the most critical field.**
 
+**Syntax:** write it as a YAML block scalar with strip chomping (`description: |-`) and indent
+every line of the value by two spaces. A multi-line description without the indicator is not
+valid YAML: Claude Code logs `YAML frontmatter ... failed to parse` and ignores the agent
+(`.claude/agents/`), or registers a plugin agent with the placeholder description
+`Agent from <plugin> plugin`. `|-` rather than `|` keeps a trailing newline out of the text
+the model sees.
+
 **Must include:**
 1. Triggering conditions ("Use this agent when...")
 2. Multiple `<example>` blocks showing usage
@@ -90,19 +98,20 @@ Defines when Claude should trigger this agent. **This is the most critical field
 4. `<commentary>` explaining why agent triggers
 
 **Format:**
-```
-Use this agent when [conditions]. Examples:
+```yaml
+description: |-
+  Use this agent when [conditions]. Examples:
 
-<example>
-Context: [Scenario description]
-user: "[What user says]"
-assistant: "[How Claude should respond]"
-<commentary>
-[Why this agent is appropriate]
-</commentary>
-</example>
+  <example>
+  Context: [Scenario description]
+  user: "[What user says]"
+  assistant: "[How Claude should respond]"
+  <commentary>
+  [Why this agent is appropriate]
+  </commentary>
+  </example>
 
-[More examples...]
+  [More examples...]
 ```
 
 **Best practices:**
@@ -332,7 +341,8 @@ Ensure system prompt is complete:
 ```markdown
 ---
 name: simple-agent
-description: Use this agent when... Examples: <example>...</example>
+description: |-
+  Use this agent when... Examples: <example>...</example>
 model: inherit
 color: blue
 ---
