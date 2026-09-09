@@ -147,7 +147,7 @@ read_description() {
     # does this key-line value make Bun'"'"'s first parse fail? (the shapes the retry exists for)
     function fails_first(s,    hdr, name, r) {
       s = rtrim(s)
-      if (s == "") return 0
+      if (s == "" || s ~ /^#/) return 0
       if (s ~ /^[@`%]/) return 1
       if (s ~ /^\*/) { name = substr(s, 2); sub(/[ \t].*$/, "", name); return !(name in anchors) }
       if (s ~ /^[|>]/) { hdr = substr(s, 2); sub(/^[-+0-9]+/, "", hdr); return (hdr !~ /^[ \t]*(#.*)?$/) }
@@ -160,6 +160,7 @@ read_description() {
       if (s ~ /^\[/) return (s !~ /\][ \t]*(#.*)?$/)
       if (s ~ /^\{/) return (s !~ /\}[ \t]*(#.*)?$/)
       if (s ~ /^[&!][^ \t]*[ \t]+/) { sub(/^[&!][^ \t]*[ \t]+/, "", s); return fails_first(s) }
+      s = rtrim(strip_comment(s))
       if (s ~ /: / || s ~ /:$/) return 1
       return 0
     }
@@ -171,19 +172,43 @@ read_description() {
       if (s ~ /^\[.*\]$/) return 0
       return (s ~ /[][{}*&#!|>%@`]/ || s ~ /: /)
     }
-    function reset() { kind = "absent"; n = 0; split("", body); first = ""; first_set = 0; verbatim = 0; tagged = 0; nextline = 0; style = ""; chomp = "clip"; ind = 0; raw = ""; q = "" }
+    function reset() { kind = "absent"; n = 0; split("", body); first = ""; first_set = 0; verbatim = 0; tagged = 0; tagtype = ""; nextline = 0; style = ""; chomp = "clip"; ind = 0; raw = ""; q = ""; alias_line = 0 }
     function verbatim_value(v) { kind = "plain"; first = v; first_set = 1; verbatim = 1; state = "done" }
+    # one line after the key line, in state plain (value not started), block, plain or quoted
+    function feed(rawline, line) {
+      if (state == "plain" && !first_set) {
+        # the value has not started on the key line: skip blank and comment lines, then read
+        # the first content line as if it were the value
+        if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) return
+        if (line !~ /^[ \t]/) { state = "done"; return }
+        nextline = 1; dispatch(ltrim(line), ltrim(rawline), 1); return
+      }
+      if (state == "block" || state == "plain") {
+        if (line ~ /^[ \t]*$/ || line ~ /^[ \t]/) { body[n++] = line; return }
+        state = "done"; return
+      }
+      if (state == "quoted") {
+        raw = raw "\n" rawline
+        if (closes(rawline)) state = "done"
+      }
+    }
     # the value part of the key line, or (from_next) the first content line after an empty one
     function dispatch(val, valraw, from_next,    hdr, flags, rest, name) {
       if (!from_next && retry_mode && retry_quotes(valraw)) { verbatim_value(val); return }
       while (val ~ /^[&!][^ \t]*([ \t]+|$)/) {
-        if (val ~ /^!/) tagged = 1
+        if (val ~ /^!/) {
+          tag = val; sub(/[ \t].*$/, "", tag)
+          if (tag == "!!str") tagged = 1
+          else if (tag == "!!null") tagtype = "null"
+          else if (tag == "!!int" || tag == "!!float") tagtype = "number"
+          else if (tag == "!!bool") tagtype = "boolean"
+        }
         sub(/^[&!][^ \t]*[ \t]*/, "", val); sub(/^[&!][^ \t]*[ \t]*/, "", valraw)
       }
       if (val == "" || val ~ /^#/) { kind = "plain"; state = "plain"; return }
       if (val ~ /^\*/) {
         name = substr(val, 2); sub(/[ \t].*$/, "", name)
-        if (name in anchors) { kind = "plain"; first = anchors[name]; first_set = 1; state = "done"; return }
+        if (name in anchors) { alias_line = anchors[name]; dispatch(anchor_val[name], anchor_valraw[name], 0); return }
         kind = "invalid"; state = "done"; return
       }
       if (val ~ /^[|>]/) {
@@ -230,9 +255,9 @@ read_description() {
           if (fails_first(val)) retry_mode = 1
           if (val ~ /^&[^ \t]+[ \t]+/) {
             name = substr(val, 2); sub(/[ \t].*$/, "", name)
-            v = val; sub(/^&[^ \t]+[ \t]+/, "", v); v = rtrim(strip_comment(v))
-            if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
-            anchors[name] = v
+            v = val; sub(/^&[^ \t]+[ \t]+/, "", v)
+            vraw = L[i]; sub(/^[A-Za-z_-]+:[ \t]+&[^ \t]+[ \t]+/, "", vraw)
+            anchors[name] = i; anchor_val[name] = v; anchor_valraw[name] = vraw
           }
         }
       }
@@ -245,24 +270,16 @@ read_description() {
           if (rawline !~ keyre) continue
           val = line; sub(/^[^:]*:[ \t]*/, "", val)
           valraw = rawline; sub(/^[^:]*:[ \t]*/, "", valraw)
-          dispatch(val, valraw, 0); continue
-        }
-        if (state == "plain" && !first_set) {
-          # the value has not started on the key line: skip blank and comment lines, then read
-          # the first content line as if it were the value
-          if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) continue
-          if (line !~ /^[ \t]/) { state = "done"; continue }
-          nextline = 1; dispatch(ltrim(line), ltrim(rawline), 1); continue
-        }
-        if (state == "block" || state == "plain") {
-          if (line ~ /^[ \t]*$/ || line ~ /^[ \t]/) { body[n++] = line; continue }
-          state = "done"; continue
-        }
-        if (state == "quoted") {
-          raw = raw "\n" rawline
-          if (closes(rawline)) state = "done"
+          dispatch(val, valraw, 0)
+          if (alias_line) {
+            # the alias took the key-line value of the anchor; the lines after the anchor line belong to it too
+            for (j = alias_line + 1; j <= N && state != "done"; j++) { rl = L[j]; ln = rl; sub(/\r$/, "", ln); feed(rl, ln) }
+            state = "done"; alias_line = 0
+          }
           continue
         }
+        if (state == "done") continue
+        feed(rawline, line)
       }
       out = ""
       if (kind == "block" && retry_mode) kind = "invalid"
@@ -361,7 +378,9 @@ read_description() {
                     h = substr(s, i + 2, 4)
                     if (length(h) == 4 && h ~ /^[0-9a-fA-F]+$/) { lo = hex2dec(h); if (lo >= 56320 && lo < 57344) { code = 65536 + (code - 55296) * 1024 + (lo - 56320); i += 6 } }
                   }
-                  out = out utf8(code); continue
+                  ch = utf8(code)
+                  if (code == 32) ch = "\003"; else if (code == 9) ch = "\004"
+                  out = out ch; continue
                 }
                 out = out "\\" d
               }
@@ -395,7 +414,8 @@ read_description() {
       # A one-line plain scalar that the YAML 1.2 core schema resolves to a number, boolean or
       # null is not a string: the project-agent loader drops the agent, a plugin agent shows
       # the JavaScript value (0x1f as 31, .inf as Infinity). A tag (!!str) makes it a string.
-      if (kind == "plain" && cont == 0 && !verbatim && !tagged) {
+      if (kind == "plain" && cont == 0 && !verbatim && tagtype != "") kind = tagtype
+      else if (kind == "plain" && cont == 0 && !verbatim && !tagged) {
         if (out ~ /^(null|Null|NULL|~)$/) kind = "null"
         else if (out ~ /^(true|True|TRUE|false|False|FALSE)$/) kind = "boolean"
         else if (out ~ /^([-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$/ || out ~ /^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$/ || out ~ /^([-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN))$/) kind = "number"
@@ -410,10 +430,12 @@ read_description() {
 # The product's verdict: `claude plugin validate --json` over a throwaway plugin holding a copy
 # of the file. Sets PRODUCT_STATUS (verified | not-verified), PRODUCT_REASON, PRODUCT_ERRORS
 # and PRODUCT_WARNINGS (one "path: message" per line). A report counts only when it is
-# complete: the JSON must be the validator's report object (success, manifest, contents) and
-# the plain report must carry its manifest heading and closing verdict line, from a command
-# that exited 0 or 1. Anything else — a crash, a truncated report, an unrelated JSON object —
-# leaves the frontmatter unverified rather than passed.
+# complete and consistent: the JSON must be the validator's report object (success, manifest,
+# contents) and the plain report must carry its manifest heading and closing verdict line; a
+# success must come with exit 0 and no agent error, a failure with exit 1 and at least one
+# agent error to show for it. Anything else — a crash, a truncated report, an unrelated JSON
+# object, a failure that names no problem — leaves the frontmatter unverified rather than
+# passed.
 # ---------------------------------------------------------------------------------------------
 PRODUCT_STATUS="not-verified"; PRODUCT_REASON=""; PRODUCT_ERRORS=""; PRODUCT_WARNINGS=""
 product_verdict() {
@@ -439,6 +461,16 @@ product_verdict() {
     fi
     PRODUCT_ERRORS=$(printf '%s' "$out" | jq -r '.contents[]? | select(.type == "agent") | .errors[]? | "\(.path): \(.message)"')
     PRODUCT_WARNINGS=$(printf '%s' "$out" | jq -r '.contents[]? | select(.type == "agent") | .warnings[]? | "\(.path): \(.message)"')
+    local success
+    success=$(printf '%s' "$out" | jq -r '.success')
+    if [ "$success" = "true" ] && { [ $rc -ne 0 ] || [ -n "$PRODUCT_ERRORS" ]; }; then
+      PRODUCT_REASON="'$CLAUDE_BIN plugin validate' reported success with exit $rc and $(printf '%s\n' "$PRODUCT_ERRORS" | LC_ALL=C awk 'NF { n++ } END { print n + 0 }') agent error(s)"
+      PRODUCT_ERRORS=""; PRODUCT_WARNINGS=""; return 0
+    fi
+    if [ "$success" = "false" ] && { [ $rc -ne 1 ] || [ -z "$PRODUCT_ERRORS" ]; }; then
+      PRODUCT_REASON="'$CLAUDE_BIN plugin validate' reported failure (exit $rc) without an agent diagnostic"
+      PRODUCT_ERRORS=""; PRODUCT_WARNINGS=""; return 0
+    fi
   fi
   if [ $parsed -eq 0 ]; then
     # No jq, or a Claude Code older than 2.1.259 (no --json): read the plain report. Items are
@@ -457,6 +489,16 @@ product_verdict() {
       /^[ \t]*❯ / { if (insec) { sub(/^[ \t]*❯ /, ""); print k "\t" $0 } }')
     PRODUCT_ERRORS=$(printf '%s\n' "$items" | LC_ALL=C awk -F'\t' '$1 == "E" { print $2 }')
     PRODUCT_WARNINGS=$(printf '%s\n' "$items" | LC_ALL=C awk -F'\t' '$1 == "W" { print $2 }')
+    local verdict
+    verdict=$(printf '%s\n' "$out" | LC_ALL=C awk '/Validation passed/ { v = "passed" } /Validation failed/ { v = "failed" } END { print v }')
+    if [ "$verdict" = "passed" ] && { [ $rc -ne 0 ] || [ -n "$PRODUCT_ERRORS" ]; }; then
+      PRODUCT_REASON="'$CLAUDE_BIN plugin validate' reported success with exit $rc and an agent error"
+      PRODUCT_ERRORS=""; PRODUCT_WARNINGS=""; return 0
+    fi
+    if [ "$verdict" = "failed" ] && { [ $rc -ne 1 ] || [ -z "$PRODUCT_ERRORS" ]; }; then
+      PRODUCT_REASON="'$CLAUDE_BIN plugin validate' reported failure (exit $rc) without an agent diagnostic"
+      PRODUCT_ERRORS=""; PRODUCT_WARNINGS=""; return 0
+    fi
   fi
   PRODUCT_STATUS="verified"
   return 0
@@ -491,9 +533,9 @@ BOM=$(printf '\357\273\277')
 RAW=$(cat -- "$AGENT_FILE"; printf x); RAW=${RAW%x}
 HAS_BOM=0
 if [ "${RAW#"$BOM"}" != "$RAW" ]; then HAS_BOM=1; RAW=${RAW#"$BOM"}; fi
-CONTENT=$(printf '%s' "$RAW" | tr -d '\r')
+CONTENT=$(printf '%s' "$RAW" | tr -d '\r'; printf x); CONTENT=${CONTENT%x}
 HAS_CR=0
-[ "$CONTENT" != "$RAW" ] && HAS_CR=1
+case "$RAW" in *$'\r'*) HAS_CR=1 ;; esac
 
 # Check 2: Starts with ---
 FM_OUT=$(printf '%s\n' "$RAW" | frontmatter_cut)

@@ -50,6 +50,18 @@
 #                 comment then text, flow sequence) was read as absent
 #   verbatim      `| text`, `>- text`, `[text`, `{text` and `"quoted" junk` load through the
 #                 retry as literal text; the script reported them as blocks, lists or invalid
+#   report-sense  a report whose verdict was "failed" (success false, exit 1) but named no agent
+#                 error was read as a pass; a failure without a diagnostic is "not verified"
+#   tag-type      `!!null null` and `!!int 12345678901` passed the value policy because every
+#                 explicit tag was treated as !!str
+#   retry-comment `note: harmless # Context: a comment` was read as a value with ': ' and put
+#                 the whole file into retry mode, turning a block description into the text `|-`
+#   alias-block   `summary: &trigger |-` with a body, then `description: *trigger`, resolved to
+#                 the header `|-` instead of the block's text
+#   hex-space     `\x20` before a line break inside a double-quoted value was folded away; it is
+#                 escaped whitespace and the runtime keeps it
+#   lf-note       every LF file printed the CRLF note (the CR test compared a value with its
+#                 trailing newlines to one without)
 #
 # Requirements: Claude Code 2.1.259 or newer on PATH (for `claude plugin validate --json`) and
 # jq. Without them the suite FAILS; it never skips, because a skipped suite reads as green.
@@ -384,6 +396,26 @@ description: "Use this agent when\
   the user asks <example>x</example>"
 E
 printf -- '---\nname: r19-nbsp-trailing\ndescription: Use this agent when the user asks for a test. <example>x</example>\302\240\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/r19-nbsp-trailing.md"
+mk r21-tag-null <<'E'
+description: !!null null
+E
+mk r22-tag-int <<'E'
+description: !!int 12345678901
+E
+mk r23-false-retry-comment <<'E'
+description: |-
+  Use this agent when testing behavior. <example>block</example>
+note: harmless # Context: a comment
+E
+mk r24-alias-block <<'E'
+summary: &trigger |-
+  Use this agent when testing behavior. <example>alias</example>
+description: *trigger
+E
+mk r25-hex-space-break <<'E'
+description: "Use this agent when\x20
+  testing behavior. <example>space</example>"
+E
 printf -- '---\nname: r20-dq-escaped-tab-char\ndescription: "Use this agent when\\\tthe user asks <example>x</example>"\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/r20-dq-escaped-tab-char.md"
 printf -- '---\r\nname: h14-crlf-dq-multi\r\ndescription: "Use this agent when the user asks for a test.\r\n  <example>crlf quoted</example>"\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h14-crlf-dq-multi.md"
 printf -- '---\r\nname: h16-crlf-plain-multi\r\ndescription: Use this agent when the user asks for a test.\r\n  <example>crlf plain</example>\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h16-crlf-plain-multi.md"
@@ -411,9 +443,9 @@ product_error_count=$(printf '%s' "$REPORT" | jq -r '[.contents[]? | select(.typ
 # JavaScript value.
 policy_reject() {
   case "$1" in
-    f19-empty-then-key|f20-block-empty|g05-null-word|g36-block-only-blank-lines|r03-nbsp-only) echo "description is empty" ;;
+    f19-empty-then-key|f20-block-empty|g05-null-word|g36-block-only-blank-lines|r03-nbsp-only|r21-tag-null) echo "description is empty" ;;
     h05-dashes-in-value) echo "ends it early" ;;
-    f23-number|g06-hex) echo "reads as a YAML number" ;;
+    f23-number|g06-hex|r22-tag-int) echo "reads as a YAML number" ;;
     g03-true) echo "reads as a YAML boolean" ;;
     *) echo "" ;;
   esac
@@ -515,11 +547,14 @@ r17-dq-tab-escape-before-break	Use this agent when\t the user asks <example>x</e
 r18-dq-escaped-break-then-blank	Use this agent when\nthe user asks <example>x</example>
 r19-nbsp-trailing	Use this agent when the user asks for a test. <example>x</example>
 r20-dq-escaped-tab-char	Use this agent when\tthe user asks <example>x</example>
+r23-false-retry-comment	Use this agent when testing behavior. <example>block</example>
+r24-alias-block	Use this agent when testing behavior. <example>alias</example>
+r25-hex-space-break	Use this agent when  testing behavior. <example>space</example>
 TABLE
 if [ $text_ok -eq $text_total ]; then pass "description text matches the runtime on $text_ok/$text_total shapes"; else flunk "description text: $text_ok/$text_total shapes match the runtime"; fi
 
 # --description refuses what the loader would not show as text.
-for name in f19-empty-then-key f21-list-value f23-number g25-mapping-value r03-nbsp-only r11-next-line-flowseq; do
+for name in f19-empty-then-key f21-list-value f23-number g25-mapping-value r03-nbsp-only r11-next-line-flowseq r21-tag-null r22-tag-int; do
   ERR=$(bash "$VALIDATOR" --description "$CORPUS/agents/$name.md" 2>&1 >/dev/null); rc=$?
   if [ $rc -eq 1 ] && case "$ERR" in description:*) true;; *) false;; esac; then pass "--description refuses $name ($ERR)"; else flunk "--description $name: exit $rc, stderr '$ERR' (expected exit 1 and 'description: <kind>')"; fi
 done
@@ -535,6 +570,8 @@ run "$CORPUS/agents/f03-plain-colon-space.md"
 if [ $RC -eq 0 ] && has "containing ': '"; then pass "single line containing ': ' accepted with a warning"; else flunk "f03: exit $RC, warning present: $(has "containing ': '" && echo yes || echo no)"; fi
 run "$CORPUS/agents/f29-crlf-block.md"
 if [ $RC -eq 0 ] && has "CRLF"; then pass "CRLF file accepted with a note"; else flunk "f29: exit $RC, CRLF note: $(has CRLF && echo yes || echo no) (crlf)"; fi
+run "$CORPUS/agents/f01-plain-single.md"
+if [ $RC -eq 0 ] && ! has "CRLF"; then pass "LF file: no CRLF note"; else flunk "f01: exit $RC, CRLF note on an LF file: $(has CRLF && echo yes || echo no) (lf-note)"; fi
 run "$CORPUS/agents/bom-block.md"
 if [ $RC -eq 0 ] && has "byte order mark"; then pass "BOM file accepted with a note"; else flunk "bom-block: exit $RC, BOM note: $(has 'byte order mark' && echo yes || echo no)"; fi
 run "$CORPUS/agents/h05-dashes-in-value.md"
@@ -648,13 +685,15 @@ fi
 printf '#!/bin/bash\necho '"'"'{"error":"validator failed before inspecting the agent"}'"'"'\nexit 0\n' > "$TMP_DIR/shim/claude-json-unrelated"
 printf '#!/bin/bash\necho '"'"'{"error":"validator failed before inspecting the agent"}'"'"'\nexit 3\n' > "$TMP_DIR/shim/claude-json-exit3"
 printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "--json" ] && { echo "error: unknown option '"'"'--json'"'"'" >&2; exit 1; }; done\necho "Validating plugin manifest: $2"\nexit 0\n' > "$TMP_DIR/shim/claude-plain-truncated"
-chmod +x "$TMP_DIR/shim/claude-json-unrelated" "$TMP_DIR/shim/claude-json-exit3" "$TMP_DIR/shim/claude-plain-truncated"
-for shim in claude-json-unrelated claude-json-exit3 claude-plain-truncated; do
+printf '#!/bin/bash\necho '"'"'{"success":false,"manifest":{"errors":[]},"contents":[]}'"'"'\nexit 1\n' > "$TMP_DIR/shim/claude-json-failed"
+printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "--json" ] && { echo "error: unknown option '"'"'--json'"'"'" >&2; exit 1; }; done\necho "Validating plugin manifest: $2/.claude-plugin/plugin.json"\necho "Validation failed: stopped before validating agents"\nexit 1\n' > "$TMP_DIR/shim/claude-plain-failed"
+chmod +x "$TMP_DIR/shim/claude-json-unrelated" "$TMP_DIR/shim/claude-json-exit3" "$TMP_DIR/shim/claude-plain-truncated" "$TMP_DIR/shim/claude-json-failed" "$TMP_DIR/shim/claude-plain-failed"
+for shim in claude-json-unrelated claude-json-exit3 claude-plain-truncated claude-json-failed claude-plain-failed; do
   OUT=$(CLAUDE_BIN="$TMP_DIR/shim/$shim" bash "$VALIDATOR" "$TMP_DIR/no-tools.md" 2>&1); RC=$?
   if [ $RC -eq 2 ] && has "Frontmatter not verified" && has "Validation incomplete" && ! has "Frontmatter parses"; then
     pass "$shim: exit 2, frontmatter reported unverified"
   else
-    flunk "$shim: exit $RC, 'not verified' present: $(has 'Frontmatter not verified' && echo yes || echo no), 'parses' present: $(has 'Frontmatter parses' && echo yes || echo no) (report-shape)"
+    flunk "$shim: exit $RC, 'not verified' present: $(has 'Frontmatter not verified' && echo yes || echo no), 'parses' present: $(has 'Frontmatter parses' && echo yes || echo no) (report-shape / report-sense)"
   fi
 done
 
