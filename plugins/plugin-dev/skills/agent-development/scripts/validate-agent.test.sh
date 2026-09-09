@@ -67,6 +67,10 @@
 #                 anchor on a quoted key (`"summary": &trigger ...`) was not seen at all
 #   tag-next-line `description: !!null` with `null` on the next line passed as four characters of
 #                 text; the type policy only looked at values starting on the key line
+#   nested-anchor an anchor defined on an indented key (`metadata:` / `  summary: &trigger ...`)
+#                 was not collected, so `description: *trigger` read as the literal `*trigger`
+#   quoted-retry  `"description": |-` in a file whose other line triggers the loader's retry was
+#                 reported unreadable; the retry rewrites bare-key lines only, so the block stays
 #
 # Requirements: Claude Code 2.1.259 or newer on PATH (for `claude plugin validate --json`) and
 # jq. Without them the suite FAILS; it never skips, because a skipped suite reads as green.
@@ -440,6 +444,34 @@ E
 mk r30-tag-quoted-number <<'E'
 description: !!int "12345678901"
 E
+mk r31-quoted-block-retry <<'E'
+"description": |-
+  Use this agent when testing behavior. <example>block</example>
+note: @repair
+E
+mk r32-quoted-plain-retry <<'E'
+"description": Use this agent when testing behavior. <example>plain</example>
+note: @repair
+E
+mk r33-nested-anchor <<'E'
+metadata:
+  summary: &trigger Use this agent when testing behavior. <example>alias</example>
+description: *trigger
+E
+mk r34-nested-anchor-block <<'E'
+metadata:
+  summary: &trigger |-
+    Use this agent when testing behavior. <example>nested</example>
+  other: value
+description: *trigger
+E
+mk r35-nested-anchor-next-line <<'E'
+metadata:
+  summary: &trigger
+    Use this agent when testing behavior. <example>next</example>
+  other: value
+description: *trigger
+E
 printf -- '---\nname: r20-dq-escaped-tab-char\ndescription: "Use this agent when\\\tthe user asks <example>x</example>"\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/r20-dq-escaped-tab-char.md"
 printf -- '---\r\nname: h14-crlf-dq-multi\r\ndescription: "Use this agent when the user asks for a test.\r\n  <example>crlf quoted</example>"\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h14-crlf-dq-multi.md"
 printf -- '---\r\nname: h16-crlf-plain-multi\r\ndescription: Use this agent when the user asks for a test.\r\n  <example>crlf plain</example>\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h16-crlf-plain-multi.md"
@@ -578,6 +610,11 @@ r27-alias-rebound	Use this agent when testing behavior. <example>first</example>
 r28-alias-quoted-key	Use this agent when testing behavior. <example>alias</example>
 r29-tag-quoted-null	null
 r30-tag-quoted-number	12345678901
+r31-quoted-block-retry	Use this agent when testing behavior. <example>block</example>
+r32-quoted-plain-retry	Use this agent when testing behavior. <example>plain</example>
+r33-nested-anchor	Use this agent when testing behavior. <example>alias</example>
+r34-nested-anchor-block	Use this agent when testing behavior. <example>nested</example>
+r35-nested-anchor-next-line	Use this agent when testing behavior. <example>next</example>
 TABLE
 if [ $text_ok -eq $text_total ]; then pass "description text matches the runtime on $text_ok/$text_total shapes"; else flunk "description text: $text_ok/$text_total shapes match the runtime"; fi
 

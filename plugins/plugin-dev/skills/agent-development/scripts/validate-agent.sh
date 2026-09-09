@@ -177,19 +177,21 @@ read_description() {
       for (k = na; k >= 1; k--) if (anchor_name[k] == name && anchor_line[k] < before) return k
       return 0
     }
-    function reset() { kind = "absent"; n = 0; split("", body); first = ""; first_set = 0; verbatim = 0; tagged = 0; tagtype = ""; nextline = 0; style = ""; chomp = "clip"; ind = 0; raw = ""; q = ""; alias_line = 0 }
+    function reset() { kind = "absent"; n = 0; split("", body); first = ""; first_set = 0; verbatim = 0; tagged = 0; tagtype = ""; nextline = 0; style = ""; chomp = "clip"; ind = 0; raw = ""; q = ""; alias_line = 0; base_indent = 0 }
     function verbatim_value(v) { kind = "plain"; first = v; first_set = 1; verbatim = 1; state = "done" }
     # one line after the key line, in state plain (value not started), block, plain or quoted
-    function feed(rawline, line) {
+    function indent_of(s) { match(s, /^[ \t]*/); return RLENGTH }
+    function feed(rawline, line,    d) {
+      d = (line ~ /^[ \t]*$/) ? -1 : indent_of(line)
       if (state == "plain" && !first_set) {
         # the value has not started on the key line: skip blank and comment lines, then read
         # the first content line as if it were the value
-        if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) return
-        if (line !~ /^[ \t]/) { state = "done"; return }
+        if (d < 0 || line ~ /^[ \t]*#/) return
+        if (d <= base_indent) { state = "done"; return }
         nextline = 1; dispatch(ltrim(line), ltrim(rawline), 1); return
       }
       if (state == "block" || state == "plain") {
-        if (line ~ /^[ \t]*$/ || line ~ /^[ \t]/) { body[n++] = line; return }
+        if (d < 0 || d > base_indent) { body[n++] = line; return }
         state = "done"; return
       }
       if (state == "quoted") {
@@ -219,7 +221,7 @@ read_description() {
       if (val ~ /^\*/) {
         name = substr(val, 2); sub(/[ \t].*$/, "", name)
         k = find_anchor(name, cur)
-        if (k) { alias_line = anchor_line[k]; dispatch(anchor_val[k], anchor_valraw[k], 0); return }
+        if (k) { alias_line = anchor_line[k]; base_indent = anchor_indent[k]; dispatch(anchor_val[k], anchor_valraw[k], 0); return }
         kind = "invalid"; state = "done"; return
       }
       if (val ~ /^[|>]/) {
@@ -249,7 +251,7 @@ read_description() {
     }
     BEGIN {
       keyre = "^(\"description\"|\047description\047|description)[ \t]*:([ \t\r]|$)"
-      anykey = "^(\"[^\"]*\"|\047[^\047]*\047|[A-Za-z0-9_.-]+)[ \t]*:[ \t]+"
+      anykey = "^[ \t]*(\"[^\"]*\"|\047[^\047]*\047|[A-Za-z0-9_.-]+)[ \t]*:[ \t]+"
       na = 0; cur = 0; key_quoted = 0
       nws = split(" |\t|\n|\r|\013|\014|\302\240|\341\232\200|\342\200\200|\342\200\201|\342\200\202|\342\200\203|\342\200\204|\342\200\205|\342\200\206|\342\200\207|\342\200\210|\342\200\211|\342\200\212|\342\200\250|\342\200\251|\342\200\257|\342\201\237|\343\200\200|\357\273\277", WS, "|")
       N = 0
@@ -262,16 +264,29 @@ read_description() {
       for (i = 1; i <= N; i++) {
         if (substr(L[i], 1, 1) == "\t") retry_mode = 1
         while (substr(L[i], 1, 1) == "\t") L[i] = "  " substr(L[i], 2)
+      }
+      # key lines at any nesting level; the lines of a scalar value (deeper than its key, or up
+      # to the closing quote) are not keys
+      skip_indent = -1; inq = 0
+      for (i = 1; i <= N; i++) {
         line = L[i]; sub(/\r$/, "", line); cur = i
-        if (match(line, anykey) && substr(line, RLENGTH + 1) ~ /^[^ \t]/) {
-          val = substr(line, RLENGTH + 1); vraw = substr(L[i], RLENGTH + 1)
-          if (fails_first(val)) retry_mode = 1
-          if (val ~ /^&[^ \t]+([ \t]+|$)/) {
-            name = substr(val, 2); sub(/[ \t].*$/, "", name)
-            sub(/^&[^ \t]+[ \t]*/, "", val); sub(/^&[^ \t]+[ \t]*/, "", vraw)
-            na++; anchor_name[na] = name; anchor_line[na] = i; anchor_val[na] = val; anchor_valraw[na] = vraw
-          }
+        if (inq) { if (closes(line)) inq = 0; continue }
+        if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) continue
+        d = indent_of(line)
+        if (skip_indent >= 0 && d > skip_indent) continue
+        skip_indent = -1
+        if (!match(line, anykey)) continue
+        val = substr(line, RLENGTH + 1); vraw = substr(L[i], RLENGTH + 1)
+        if (val ~ /^[ \t]*$/ || val ~ /^#/) continue
+        if (fails_first(val)) retry_mode = 1
+        if (val ~ /^&[^ \t]+([ \t]+|$)/) {
+          name = substr(val, 2); sub(/[ \t].*$/, "", name)
+          sub(/^&[^ \t]+[ \t]*/, "", val); sub(/^&[^ \t]+[ \t]*/, "", vraw)
+          na++; anchor_name[na] = name; anchor_line[na] = i; anchor_indent[na] = d; anchor_val[na] = val; anchor_valraw[na] = vraw
         }
+        v = val; sub(/^[&!][^ \t]*[ \t]*/, "", v); sub(/^[&!][^ \t]*[ \t]*/, "", v)
+        if (v ~ /^["\047]/) { q = substr(v, 1, 1); if (!closes(substr(v, 2))) { inq = 1; continue } }
+        skip_indent = d
       }
       # pass 2: the description
       state = "seek"; reset()
@@ -295,7 +310,7 @@ read_description() {
         feed(rawline, line)
       }
       out = ""
-      if (kind == "block" && retry_mode) kind = "invalid"
+      if (kind == "block" && retry_mode && !key_quoted) kind = "invalid"
       if (kind == "block") {
         if (ind == 0) for (i = 0; i < n; i++) if (body[i] !~ /^[ \t]*$/) { match(body[i], /^ */); ind = RLENGTH; break }
         m = 0
