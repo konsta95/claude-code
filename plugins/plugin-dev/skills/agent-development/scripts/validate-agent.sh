@@ -229,7 +229,7 @@ read_description() {
         if (hdr ~ /^[ \t]*(#.*)?$/) {
           kind = "block"; style = substr(val, 1, 1); flags = substr(val, 2); sub(/[ \t].*$/, "", flags)
           chomp = (flags ~ /-/) ? "strip" : (flags ~ /\+/) ? "keep" : "clip"
-          if (match(flags, /[1-9]/)) ind = substr(flags, RSTART, 1) + 0
+          if (match(flags, /[1-9]/)) ind = base_indent + substr(flags, RSTART, 1)
           state = "block"; return
         }
         kind = "invalid"; state = "done"; return
@@ -285,6 +285,7 @@ read_description() {
           na++; anchor_name[na] = name; anchor_line[na] = i; anchor_indent[na] = d; anchor_val[na] = val; anchor_valraw[na] = vraw
         }
         v = val; sub(/^[&!][^ \t]*[ \t]*/, "", v); sub(/^[&!][^ \t]*[ \t]*/, "", v)
+        if (v ~ /^[ \t]*$/ || v ~ /^#/) continue
         if (v ~ /^["\047]/) { q = substr(v, 1, 1); if (!closes(substr(v, 2))) { inq = 1; continue } }
         skip_indent = d
       }

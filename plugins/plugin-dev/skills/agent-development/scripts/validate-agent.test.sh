@@ -71,6 +71,11 @@
 #                 was not collected, so `description: *trigger` read as the literal `*trigger`
 #   quoted-retry  `"description": |-` in a file whose other line triggers the loader's retry was
 #                 reported unreadable; the retry rewrites bare-key lines only, so the block stays
+#   anchored-map  `metadata: &meta` (a mapping header carrying only a node property) was taken
+#                 for a scalar, so the anchors defined under it were skipped
+#   block-indent  an explicit indentation indicator (`>2-`, `|2-`) on a nested anchored block was
+#                 counted from column 0 instead of from the key's indent, leaving two spaces and
+#                 a stray newline in the text
 #
 # Requirements: Claude Code 2.1.259 or newer on PATH (for `claude plugin validate --json`) and
 # jq. Without them the suite FAILS; it never skips, because a skipped suite reads as green.
@@ -472,6 +477,27 @@ metadata:
   other: value
 description: *trigger
 E
+mk r36-anchored-map <<'E'
+metadata: &meta
+  summary: &trigger Use this agent when testing behavior. <example>alias</example>
+description: *trigger
+E
+mk r37-nested-folded-indent <<'E'
+metadata:
+  summary: &trigger >2-
+    Use this agent when
+    testing behavior. <example>folded</example>
+  other: value
+description: *trigger
+E
+mk r38-nested-literal-indent <<'E'
+metadata:
+  summary: &trigger |2-
+    Use this agent when testing behavior.
+    <example>literal</example>
+  other: value
+description: *trigger
+E
 printf -- '---\nname: r20-dq-escaped-tab-char\ndescription: "Use this agent when\\\tthe user asks <example>x</example>"\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/r20-dq-escaped-tab-char.md"
 printf -- '---\r\nname: h14-crlf-dq-multi\r\ndescription: "Use this agent when the user asks for a test.\r\n  <example>crlf quoted</example>"\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h14-crlf-dq-multi.md"
 printf -- '---\r\nname: h16-crlf-plain-multi\r\ndescription: Use this agent when the user asks for a test.\r\n  <example>crlf plain</example>\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h16-crlf-plain-multi.md"
@@ -615,6 +641,9 @@ r32-quoted-plain-retry	Use this agent when testing behavior. <example>plain</exa
 r33-nested-anchor	Use this agent when testing behavior. <example>alias</example>
 r34-nested-anchor-block	Use this agent when testing behavior. <example>nested</example>
 r35-nested-anchor-next-line	Use this agent when testing behavior. <example>next</example>
+r36-anchored-map	Use this agent when testing behavior. <example>alias</example>
+r37-nested-folded-indent	Use this agent when testing behavior. <example>folded</example>
+r38-nested-literal-indent	Use this agent when testing behavior.\n<example>literal</example>
 TABLE
 if [ $text_ok -eq $text_total ]; then pass "description text matches the runtime on $text_ok/$text_total shapes"; else flunk "description text: $text_ok/$text_total shapes match the runtime"; fi
 
