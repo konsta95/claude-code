@@ -62,6 +62,11 @@
 #                 escaped whitespace and the runtime keeps it
 #   lf-note       every LF file printed the CRLF note (the CR test compared a value with its
 #                 trailing newlines to one without)
+#   alias-scope   `description: *trigger` took the LAST anchor of that name in the file, even one
+#                 defined after it; the loader takes the latest one defined before the alias. An
+#                 anchor on a quoted key (`"summary": &trigger ...`) was not seen at all
+#   tag-next-line `description: !!null` with `null` on the next line passed as four characters of
+#                 text; the type policy only looked at values starting on the key line
 #
 # Requirements: Claude Code 2.1.259 or newer on PATH (for `claude plugin validate --json`) and
 # jq. Without them the suite FAILS; it never skips, because a skipped suite reads as green.
@@ -416,6 +421,25 @@ mk r25-hex-space-break <<'E'
 description: "Use this agent when\x20
   testing behavior. <example>space</example>"
 E
+mk r26-tag-next-line-null <<'E'
+description: !!null
+  null
+E
+mk r27-alias-rebound <<'E'
+summary: &trigger Use this agent when testing behavior. <example>first</example>
+description: *trigger
+later: &trigger A different description for a later reference.
+E
+mk r28-alias-quoted-key <<'E'
+"summary": &trigger Use this agent when testing behavior. <example>alias</example>
+description: *trigger
+E
+mk r29-tag-quoted-null <<'E'
+description: !!null "null"
+E
+mk r30-tag-quoted-number <<'E'
+description: !!int "12345678901"
+E
 printf -- '---\nname: r20-dq-escaped-tab-char\ndescription: "Use this agent when\\\tthe user asks <example>x</example>"\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/r20-dq-escaped-tab-char.md"
 printf -- '---\r\nname: h14-crlf-dq-multi\r\ndescription: "Use this agent when the user asks for a test.\r\n  <example>crlf quoted</example>"\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h14-crlf-dq-multi.md"
 printf -- '---\r\nname: h16-crlf-plain-multi\r\ndescription: Use this agent when the user asks for a test.\r\n  <example>crlf plain</example>\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h16-crlf-plain-multi.md"
@@ -443,7 +467,7 @@ product_error_count=$(printf '%s' "$REPORT" | jq -r '[.contents[]? | select(.typ
 # JavaScript value.
 policy_reject() {
   case "$1" in
-    f19-empty-then-key|f20-block-empty|g05-null-word|g36-block-only-blank-lines|r03-nbsp-only|r21-tag-null) echo "description is empty" ;;
+    f19-empty-then-key|f20-block-empty|g05-null-word|g36-block-only-blank-lines|r03-nbsp-only|r21-tag-null|r26-tag-next-line-null) echo "description is empty" ;;
     h05-dashes-in-value) echo "ends it early" ;;
     f23-number|g06-hex|r22-tag-int) echo "reads as a YAML number" ;;
     g03-true) echo "reads as a YAML boolean" ;;
@@ -550,11 +574,15 @@ r20-dq-escaped-tab-char	Use this agent when\tthe user asks <example>x</example>
 r23-false-retry-comment	Use this agent when testing behavior. <example>block</example>
 r24-alias-block	Use this agent when testing behavior. <example>alias</example>
 r25-hex-space-break	Use this agent when  testing behavior. <example>space</example>
+r27-alias-rebound	Use this agent when testing behavior. <example>first</example>
+r28-alias-quoted-key	Use this agent when testing behavior. <example>alias</example>
+r29-tag-quoted-null	null
+r30-tag-quoted-number	12345678901
 TABLE
 if [ $text_ok -eq $text_total ]; then pass "description text matches the runtime on $text_ok/$text_total shapes"; else flunk "description text: $text_ok/$text_total shapes match the runtime"; fi
 
 # --description refuses what the loader would not show as text.
-for name in f19-empty-then-key f21-list-value f23-number g25-mapping-value r03-nbsp-only r11-next-line-flowseq r21-tag-null r22-tag-int; do
+for name in f19-empty-then-key f21-list-value f23-number g25-mapping-value r03-nbsp-only r11-next-line-flowseq r21-tag-null r22-tag-int r26-tag-next-line-null; do
   ERR=$(bash "$VALIDATOR" --description "$CORPUS/agents/$name.md" 2>&1 >/dev/null); rc=$?
   if [ $rc -eq 1 ] && case "$ERR" in description:*) true;; *) false;; esac; then pass "--description refuses $name ($ERR)"; else flunk "--description $name: exit $rc, stderr '$ERR' (expected exit 1 and 'description: <kind>')"; fi
 done

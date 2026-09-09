@@ -149,7 +149,7 @@ read_description() {
       s = rtrim(s)
       if (s == "" || s ~ /^#/) return 0
       if (s ~ /^[@`%]/) return 1
-      if (s ~ /^\*/) { name = substr(s, 2); sub(/[ \t].*$/, "", name); return !(name in anchors) }
+      if (s ~ /^\*/) { name = substr(s, 2); sub(/[ \t].*$/, "", name); return !find_anchor(name, cur) }
       if (s ~ /^[|>]/) { hdr = substr(s, 2); sub(/^[-+0-9]+/, "", hdr); return (hdr !~ /^[ \t]*(#.*)?$/) }
       if (s ~ /^"/ || s ~ /^\047/) {
         q = substr(s, 1, 1)
@@ -172,6 +172,11 @@ read_description() {
       if (s ~ /^\[.*\]$/) return 0
       return (s ~ /[][{}*&#!|>%@`]/ || s ~ /: /)
     }
+    # the latest anchor of that name defined on a line before the given one (0 when none)
+    function find_anchor(name, before,    k) {
+      for (k = na; k >= 1; k--) if (anchor_name[k] == name && anchor_line[k] < before) return k
+      return 0
+    }
     function reset() { kind = "absent"; n = 0; split("", body); first = ""; first_set = 0; verbatim = 0; tagged = 0; tagtype = ""; nextline = 0; style = ""; chomp = "clip"; ind = 0; raw = ""; q = ""; alias_line = 0 }
     function verbatim_value(v) { kind = "plain"; first = v; first_set = 1; verbatim = 1; state = "done" }
     # one line after the key line, in state plain (value not started), block, plain or quoted
@@ -193,8 +198,13 @@ read_description() {
       }
     }
     # the value part of the key line, or (from_next) the first content line after an empty one
-    function dispatch(val, valraw, from_next,    hdr, flags, rest, name) {
-      if (!from_next && retry_mode && retry_quotes(valraw)) { verbatim_value(val); return }
+    function dispatch(val, valraw, from_next,    hdr, flags, rest, name, k) {
+      # the retry rewrites this line as a quoted string - unless the key is quoted, which the
+      # rewrite does not match: then the value either parses as it is or not at all
+      if (!from_next && retry_mode && retry_quotes(valraw)) {
+        if (!key_quoted) { verbatim_value(val); return }
+        if (fails_first(valraw)) { kind = "invalid"; state = "done"; return }
+      }
       while (val ~ /^[&!][^ \t]*([ \t]+|$)/) {
         if (val ~ /^!/) {
           tag = val; sub(/[ \t].*$/, "", tag)
@@ -208,7 +218,8 @@ read_description() {
       if (val == "" || val ~ /^#/) { kind = "plain"; state = "plain"; return }
       if (val ~ /^\*/) {
         name = substr(val, 2); sub(/[ \t].*$/, "", name)
-        if (name in anchors) { alias_line = anchors[name]; dispatch(anchor_val[name], anchor_valraw[name], 0); return }
+        k = find_anchor(name, cur)
+        if (k) { alias_line = anchor_line[k]; dispatch(anchor_val[k], anchor_valraw[k], 0); return }
         kind = "invalid"; state = "done"; return
       }
       if (val ~ /^[|>]/) {
@@ -238,6 +249,8 @@ read_description() {
     }
     BEGIN {
       keyre = "^(\"description\"|\047description\047|description)[ \t]*:([ \t\r]|$)"
+      anykey = "^(\"[^\"]*\"|\047[^\047]*\047|[A-Za-z0-9_.-]+)[ \t]*:[ \t]+"
+      na = 0; cur = 0; key_quoted = 0
       nws = split(" |\t|\n|\r|\013|\014|\302\240|\341\232\200|\342\200\200|\342\200\201|\342\200\202|\342\200\203|\342\200\204|\342\200\205|\342\200\206|\342\200\207|\342\200\210|\342\200\211|\342\200\212|\342\200\250|\342\200\251|\342\200\257|\342\201\237|\343\200\200|\357\273\277", WS, "|")
       N = 0
     }
@@ -249,25 +262,25 @@ read_description() {
       for (i = 1; i <= N; i++) {
         if (substr(L[i], 1, 1) == "\t") retry_mode = 1
         while (substr(L[i], 1, 1) == "\t") L[i] = "  " substr(L[i], 2)
-        line = L[i]; sub(/\r$/, "", line)
-        if (line ~ /^[A-Za-z_-]+:[ \t]+[^ \t]/) {
-          val = line; sub(/^[A-Za-z_-]+:[ \t]+/, "", val)
+        line = L[i]; sub(/\r$/, "", line); cur = i
+        if (match(line, anykey) && substr(line, RLENGTH + 1) ~ /^[^ \t]/) {
+          val = substr(line, RLENGTH + 1); vraw = substr(L[i], RLENGTH + 1)
           if (fails_first(val)) retry_mode = 1
-          if (val ~ /^&[^ \t]+[ \t]+/) {
+          if (val ~ /^&[^ \t]+([ \t]+|$)/) {
             name = substr(val, 2); sub(/[ \t].*$/, "", name)
-            v = val; sub(/^&[^ \t]+[ \t]+/, "", v)
-            vraw = L[i]; sub(/^[A-Za-z_-]+:[ \t]+&[^ \t]+[ \t]+/, "", vraw)
-            anchors[name] = i; anchor_val[name] = v; anchor_valraw[name] = vraw
+            sub(/^&[^ \t]+[ \t]*/, "", val); sub(/^&[^ \t]+[ \t]*/, "", vraw)
+            na++; anchor_name[na] = name; anchor_line[na] = i; anchor_val[na] = val; anchor_valraw[na] = vraw
           }
         }
       }
       # pass 2: the description
       state = "seek"; reset()
       for (i = 1; i <= N; i++) {
-        rawline = L[i]; line = rawline; sub(/\r$/, "", line)
+        rawline = L[i]; line = rawline; sub(/\r$/, "", line); cur = i
         if (state != "quoted" && rawline ~ keyre) { reset(); state = "seek" }
         if (state == "seek") {
           if (rawline !~ keyre) continue
+          key_quoted = (rawline ~ /^["\047]/)
           val = line; sub(/^[^:]*:[ \t]*/, "", val)
           valraw = rawline; sub(/^[^:]*:[ \t]*/, "", valraw)
           dispatch(val, valraw, 0)
@@ -414,8 +427,8 @@ read_description() {
       # A one-line plain scalar that the YAML 1.2 core schema resolves to a number, boolean or
       # null is not a string: the project-agent loader drops the agent, a plugin agent shows
       # the JavaScript value (0x1f as 31, .inf as Infinity). A tag (!!str) makes it a string.
-      if (kind == "plain" && cont == 0 && !verbatim && tagtype != "") kind = tagtype
-      else if (kind == "plain" && cont == 0 && !verbatim && !tagged) {
+      if (kind == "plain" && cont - nextline == 0 && !verbatim && tagtype != "") kind = tagtype
+      else if (kind == "plain" && cont - nextline == 0 && !verbatim && !tagged) {
         if (out ~ /^(null|Null|NULL|~)$/) kind = "null"
         else if (out ~ /^(true|True|TRUE|false|False|FALSE)$/) kind = "boolean"
         else if (out ~ /^([-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$/ || out ~ /^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$/ || out ~ /^([-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN))$/) kind = "number"
