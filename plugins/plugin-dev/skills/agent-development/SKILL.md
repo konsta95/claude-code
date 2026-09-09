@@ -405,7 +405,13 @@ Working examples in `examples/`:
 
 Development tools in `scripts/`:
 
-- **`validate-agent.sh`** - Validate agent file structure
+- **`validate-agent.sh`** - Validate an agent file. The frontmatter verdict comes from
+  `claude plugin validate`, the product's own parser, so a shape that fails there is
+  reported with the product's message; the script adds the required-field checks the
+  product does not make (an empty, null or numeric description) and the style checks
+  (`<example>` blocks, the trigger phrase, lengths) on the text the model will see.
+  `validate-agent.sh --description agents/name.md` prints that text. Exit 2 means the
+  frontmatter was not verified because no `claude` was found (set `CLAUDE_BIN`).
 - **`test-agent-trigger.sh`** - Test if agent triggers correctly
 
 ## Implementation Workflow
