@@ -89,7 +89,9 @@ every line of the value by two spaces. A multi-line description without the indi
 valid YAML: Claude Code logs `YAML frontmatter ... failed to parse` and ignores the agent
 (`.claude/agents/`), or registers a plugin agent with the placeholder description
 `Agent from <plugin> plugin`. `|-` rather than `|` keeps a trailing newline out of the text
-the model sees.
+the model sees. Never put `---` anywhere inside the frontmatter, not even inside the
+description: Claude Code ends the frontmatter at the first `---` it finds, mid-line included,
+and every field after it is silently dropped.
 
 **Must include:**
 1. Triggering conditions ("Use this agent when...")

@@ -21,6 +21,11 @@
 #   silent-pass   with no `claude` on PATH, or one that failed to run, the frontmatter was
 #                 reported valid instead of unverified
 #   crlf          a CRLF file was rejected at the first-line check although the loader reads it
+#   cut           the frontmatter was read to the closing `---` line; the loader stops at the
+#                 first `---` anywhere, so a `---` inside a value silently drops every field
+#                 after it (the product's validator does not report this)
+#   extension     a file not named *.md was reported as parsing because the product's validator
+#                 skips it (seen against the first version of this rewrite)
 #   abort         the first warning killed the script (((x++)) exits 1 under set -e), so no
 #                 summary line was printed and warnings-only files exited 1
 #   first-line    only the first line of a multi-line description was read
@@ -28,6 +33,23 @@
 #                 that follows the description into the description text
 #   silent-abort  a file without a tools field (optional) or without a required field ended
 #                 the script at the field's grep (exit 1, no message, no summary)
+#   report-shape  a `claude` that printed an unrelated JSON object, or a plain report that never
+#                 reached its verdict line, was read as a clean report (the version before this
+#                 one; the fault shims in section 9 reproduce both)
+#   sigpipe       a file larger than the pipe buffer (64 KiB) ended the script with status 141 at
+#                 a head/grep -q reader under pipefail, or reported the frontmatter as not closed
+#   retry-doc     the loader's retry is document-wide: a `note: @x` line anywhere makes a plain
+#                 description keep its ' #' comment as text, and the script stripped it
+#   tag           `description: !!str 12345678901` was reported as a number
+#   alias         `description: *anchor` was reported as unreadable; the loader resolves it
+#   unicode-ws    a description of only U+00A0 passed as text; the loader's trim() empties it
+#   escapes       \_ \e \a \b \f \v \N \L \P \xHH \UHHHHHHHH, an escaped space or tab
+#                 before a line break, and a backslash-newline followed by a blank line were
+#                 kept literally, dropped or folded wrongly
+#   next-line     a value starting on the line after `description:` (quoted, block header,
+#                 comment then text, flow sequence) was read as absent
+#   verbatim      `| text`, `>- text`, `[text`, `{text` and `"quoted" junk` load through the
+#                 retry as literal text; the script reported them as blocks, lists or invalid
 #
 # Requirements: Claude Code 2.1.259 or newer on PATH (for `claude plugin validate --json`) and
 # jq. Without them the suite FAILS; it never skips, because a skipped suite reads as green.
@@ -37,7 +59,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VALIDATOR="${VALIDATOR:-$SCRIPT_DIR/validate-agent.sh}"
-PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+VALIDATOR="$(cd "$(dirname "$VALIDATOR")" && pwd)/$(basename "$VALIDATOR")"
+PLUGIN_ROOT="${PLUGIN_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 TMP_DIR="$(mktemp -d)" || exit 1
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -75,7 +98,10 @@ BODY="You are a test agent. Your responsibilities: follow the process steps and 
 # 1. The plugin's own agents: exit 0, a summary line, no error, and the whole description read.
 #    Their descriptions run well past 1000 characters; a first-line or truncating extractor
 #    reports 200-300.
+own_agents=$(ls "$PLUGIN_ROOT"/agents/*.md 2>/dev/null | wc -l | tr -d ' ')
+[ "$own_agents" -gt 0 ] || flunk "no agent files under $PLUGIN_ROOT/agents (set PLUGIN_ROOT when running a copy of this suite)"
 for agent in "$PLUGIN_ROOT"/agents/*.md; do
+  [ -f "$agent" ] || continue
   label="own agent $(basename "$agent")"
   run "$agent"
   if [ $RC -ne 0 ]; then flunk "$label: exit $RC"; continue; fi
@@ -91,7 +117,8 @@ CORPUS="$TMP_DIR/corpus"
 mkdir -p "$CORPUS/.claude-plugin" "$CORPUS/agents"
 printf '{"name":"validate-agent-test"}\n' > "$CORPUS/.claude-plugin/plugin.json"
 mk() { # mk NAME <<'E' ...description lines... E
-  { printf -- '---\nname: %s\n' "$1"; cat; printf 'model: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY"; } > "$CORPUS/agents/$1.md"
+  { printf -- '---\nname: %s\n' "$1"; cat; printf 'model: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY"; } > "$CORPUS/agents/$1.md" \
+    || { echo "FAIL: could not write $CORPUS/agents/$1.md"; exit 1; }
 }
 mk f01-plain-single <<'E'
 description: Use this agent when the user asks for a test. Plain single line.
@@ -270,6 +297,100 @@ description: |-
 
 E
 printf -- '\xEF\xBB\xBF---\nname: bom-block\ndescription: |-\n  Use this agent when the user asks for a test.\n  <example>x</example>\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/bom-block.md"
+mk h03-quoted-key <<'E'
+"description": Use this agent when quoted key
+E
+mk h04-second-key <<'E'
+description: Use this agent when first
+description: Use this agent when second
+E
+mk h05-dashes-in-value <<'E'
+description: |-
+  Use this agent when --- appears
+  --- and again
+E
+mk h12-plain-hash-in-continuation-start <<'E'
+description: Use this agent when the user asks for a test.
+  #not a comment? starts continuation with hash
+E
+# r-series: shapes from the two independent reviews of this script (Bun 1.4.1 replay and the
+# 2.1.266 runtime agree on every text below).
+mk r01-anchor-alias <<'E'
+summary: &trigger Use this agent when testing behavior. <example>alias</example>
+description: *trigger
+E
+mk r02-retry-comment <<'E'
+description: Use this agent when testing behavior. # <example>retry</example>
+note: @repair
+E
+mk r03-nbsp-only <<'E'
+description: "\u00a0"
+E
+mk r04-dq-escape-nbsp <<'E'
+description: "Use this agent when\_the user asks for a test. <example>x</example>"
+E
+mk r05-tag-str-number <<'E'
+description: !!str 12345678901
+E
+mk r06-space-before-colon <<'E'
+description : Use this agent when the user asks for a test <example>x</example>
+E
+mk r07-next-line-dq <<'E'
+description:
+  "Use this agent when the user asks for a test. <example>x</example>"
+E
+mk r08-next-line-sq <<'E'
+description:
+  'Use this agent when it''s a test. <example>x</example>'
+E
+mk r09-next-line-block <<'E'
+description:
+  |-
+  Use this agent when the user asks for a test.
+  <example>x</example>
+E
+mk r10-next-line-comment-then-text <<'E'
+description:
+  # a comment
+  Use this agent when the user asks for a test. <example>x</example>
+E
+mk r11-next-line-flowseq <<'E'
+description:
+  [a, b]
+E
+mk r12-pipe-then-text <<'E'
+description: | Use this agent when the user asks for a test <example>x</example>
+E
+mk r13-open-bracket <<'E'
+description: [Use this agent when the user asks for a test <example>x</example>
+E
+mk r14-open-brace <<'E'
+description: {Use this agent when the user asks for a test <example>x</example>
+E
+mk r15-dq-close-then-junk <<'E'
+description: "Use this agent when the user asks for a test" <example>x</example>
+E
+mk r16-dq-escaped-space-before-break <<'E'
+description: "Use this agent when\ 
+  the user asks <example>x</example>"
+E
+mk r17-dq-tab-escape-before-break <<'E'
+description: "Use this agent when\t
+  the user asks <example>x</example>"
+E
+mk r18-dq-escaped-break-then-blank <<'E'
+description: "Use this agent when\
+
+  the user asks <example>x</example>"
+E
+printf -- '---\nname: r19-nbsp-trailing\ndescription: Use this agent when the user asks for a test. <example>x</example>\302\240\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/r19-nbsp-trailing.md"
+printf -- '---\nname: r20-dq-escaped-tab-char\ndescription: "Use this agent when\\\tthe user asks <example>x</example>"\nmodel: sonnet\ncolor: blue\n---\n\n%s\n' "$BODY" > "$CORPUS/agents/r20-dq-escaped-tab-char.md"
+printf -- '---\r\nname: h14-crlf-dq-multi\r\ndescription: "Use this agent when the user asks for a test.\r\n  <example>crlf quoted</example>"\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h14-crlf-dq-multi.md"
+printf -- '---\r\nname: h16-crlf-plain-multi\r\ndescription: Use this agent when the user asks for a test.\r\n  <example>crlf plain</example>\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h16-crlf-plain-multi.md"
+printf -- '---\r\nname: h17-crlf-dq-blank\r\ndescription: "Use this agent when the user asks for a test.\r\n\r\n  <example>after blank</example>"\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h17-crlf-dq-blank.md"
+printf -- '---\r\nname: h21-crlf-dq-three-lines\r\ndescription: "Use this agent when a\r\n  b\r\n  c"\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h21-crlf-dq-three-lines.md"
+printf -- "---\r\nname: h22-crlf-sq-multi\r\ndescription: 'Use this agent when a\r\n  b'\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n" "$BODY" > "$CORPUS/agents/h22-crlf-sq-multi.md"
+printf -- '---\r\nname: h25-crlf-plain-verbatim\r\ndescription: Use this agent when X: y\r\nmodel: sonnet\r\ncolor: blue\r\n---\r\n\r\n%s\r\n' "$BODY" > "$CORPUS/agents/h25-crlf-plain-verbatim.md"
 
 # The product's verdict over the whole corpus, once.
 REPORT=$("$CLAUDE" plugin validate "$CORPUS" --json 2>/dev/null)
@@ -290,7 +411,8 @@ product_error_count=$(printf '%s' "$REPORT" | jq -r '[.contents[]? | select(.typ
 # JavaScript value.
 policy_reject() {
   case "$1" in
-    f19-empty-then-key|f20-block-empty|g05-null-word|g36-block-only-blank-lines) echo "description is empty" ;;
+    f19-empty-then-key|f20-block-empty|g05-null-word|g36-block-only-blank-lines|r03-nbsp-only) echo "description is empty" ;;
+    h05-dashes-in-value) echo "ends it early" ;;
     f23-number|g06-hex) echo "reads as a YAML number" ;;
     g03-true) echo "reads as a YAML boolean" ;;
     *) echo "" ;;
@@ -326,8 +448,8 @@ if [ $agree -eq $total ]; then pass "corpus: script verdict = product verdict (+
 
 # 3. The description text, as the model sees it. The f-/block- rows were observed in the agent
 #    listing Claude Code 2.1.266 handed the model with this corpus loaded through --plugin-dir;
-#    the g- rows and f31 come from replaying the loader path (Bun 1.4.1 YAML, the parse retry,
-#    trim) since they were not part of that run. Escapes are printf %b: \n newline, \t tab,
+#    the g- and h- rows and f31 come from replaying the loader path (Bun 1.4.1 YAML, the parse
+#    retry, trim) since they were not part of that run. Escapes are printf %b: \n newline, \t tab,
 #    \\ backslash.
 echo ""
 echo "Description text (--description vs runtime):"
@@ -366,11 +488,38 @@ g13-folded-more-indented	Use this agent when the user asks for a test.\n<example
 g15-dq-escapes	Use this agent when "quoted" tab\there back\\slash and é done
 g16-dq-escaped-linebreak	Use this agent when the user asks for a test.<example>joined</example>
 bom-block	Use this agent when the user asks for a test.\n<example>x</example>
+h03-quoted-key	Use this agent when quoted key
+h04-second-key	Use this agent when second
+h05-dashes-in-value	Use this agent when
+h12-plain-hash-in-continuation-start	Use this agent when the user asks for a test.
+h14-crlf-dq-multi	Use this agent when the user asks for a test.\n<example>crlf quoted</example>
+h16-crlf-plain-multi	Use this agent when the user asks for a test. <example>crlf plain</example>
+h17-crlf-dq-blank	Use this agent when the user asks for a test.\n\n<example>after blank</example>
+h21-crlf-dq-three-lines	Use this agent when a\nb\nc
+h22-crlf-sq-multi	Use this agent when a\nb
+r01-anchor-alias	Use this agent when testing behavior. <example>alias</example>
+r02-retry-comment	Use this agent when testing behavior. # <example>retry</example>
+r04-dq-escape-nbsp	Use this agent when\0302\0240the user asks for a test. <example>x</example>
+r05-tag-str-number	12345678901
+r06-space-before-colon	Use this agent when the user asks for a test <example>x</example>
+r07-next-line-dq	Use this agent when the user asks for a test. <example>x</example>
+r08-next-line-sq	Use this agent when it's a test. <example>x</example>
+r09-next-line-block	Use this agent when the user asks for a test.\n<example>x</example>
+r10-next-line-comment-then-text	Use this agent when the user asks for a test. <example>x</example>
+r12-pipe-then-text	| Use this agent when the user asks for a test <example>x</example>
+r13-open-bracket	[Use this agent when the user asks for a test <example>x</example>
+r14-open-brace	{Use this agent when the user asks for a test <example>x</example>
+r15-dq-close-then-junk	"Use this agent when the user asks for a test" <example>x</example>
+r16-dq-escaped-space-before-break	Use this agent when  the user asks <example>x</example>
+r17-dq-tab-escape-before-break	Use this agent when\t the user asks <example>x</example>
+r18-dq-escaped-break-then-blank	Use this agent when\nthe user asks <example>x</example>
+r19-nbsp-trailing	Use this agent when the user asks for a test. <example>x</example>
+r20-dq-escaped-tab-char	Use this agent when\tthe user asks <example>x</example>
 TABLE
 if [ $text_ok -eq $text_total ]; then pass "description text matches the runtime on $text_ok/$text_total shapes"; else flunk "description text: $text_ok/$text_total shapes match the runtime"; fi
 
 # --description refuses what the loader would not show as text.
-for name in f19-empty-then-key f21-list-value f23-number g25-mapping-value; do
+for name in f19-empty-then-key f21-list-value f23-number g25-mapping-value r03-nbsp-only r11-next-line-flowseq; do
   ERR=$(bash "$VALIDATOR" --description "$CORPUS/agents/$name.md" 2>&1 >/dev/null); rc=$?
   if [ $rc -eq 1 ] && case "$ERR" in description:*) true;; *) false;; esac; then pass "--description refuses $name ($ERR)"; else flunk "--description $name: exit $rc, stderr '$ERR' (expected exit 1 and 'description: <kind>')"; fi
 done
@@ -388,6 +537,11 @@ run "$CORPUS/agents/f29-crlf-block.md"
 if [ $RC -eq 0 ] && has "CRLF"; then pass "CRLF file accepted with a note"; else flunk "f29: exit $RC, CRLF note: $(has CRLF && echo yes || echo no) (crlf)"; fi
 run "$CORPUS/agents/bom-block.md"
 if [ $RC -eq 0 ] && has "byte order mark"; then pass "BOM file accepted with a note"; else flunk "bom-block: exit $RC, BOM note: $(has 'byte order mark' && echo yes || echo no)"; fi
+run "$CORPUS/agents/h05-dashes-in-value.md"
+if [ $RC -eq 1 ] && has "ends it early" && has "line 4" && has "Missing required field: model"; then pass "'---' inside a value: reported as cutting the frontmatter at line 4, fields after it missing"; else flunk "h05: exit $RC, cut message: $(has 'ends it early' && echo yes || echo no), line 4 named: $(has 'line 4' && echo yes || echo no) (cut)"; fi
+cp "$CORPUS/agents/f01-plain-single.md" "$TMP_DIR/agent.txt"
+run "$TMP_DIR/agent.txt"
+if [ $RC -eq 1 ] && has "skips 'agent.txt'"; then pass "non-.md file: error, frontmatter not claimed verified"; else flunk "agent.txt: exit $RC, skip message: $(has "skips 'agent.txt'" && echo yes || echo no) (extension)"; fi
 
 # 5. Absorption: keys after the description must not be counted as description text.
 DESC='Use this agent when the user asks for X. Examples: <example>Context: c</example>'
@@ -488,6 +642,22 @@ else
   flunk "broken claude: exit $RC, 'not verified' present: $(has 'Frontmatter not verified' && echo yes || echo no) (silent-pass)"
 fi
 
+# A `claude` that runs but does not produce the validator's report: an unrelated JSON object
+# (exit 0 or 3), or a plain report cut off before its verdict line. Each is "not verified",
+# never a pass (report-shape).
+printf '#!/bin/bash\necho '"'"'{"error":"validator failed before inspecting the agent"}'"'"'\nexit 0\n' > "$TMP_DIR/shim/claude-json-unrelated"
+printf '#!/bin/bash\necho '"'"'{"error":"validator failed before inspecting the agent"}'"'"'\nexit 3\n' > "$TMP_DIR/shim/claude-json-exit3"
+printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "--json" ] && { echo "error: unknown option '"'"'--json'"'"'" >&2; exit 1; }; done\necho "Validating plugin manifest: $2"\nexit 0\n' > "$TMP_DIR/shim/claude-plain-truncated"
+chmod +x "$TMP_DIR/shim/claude-json-unrelated" "$TMP_DIR/shim/claude-json-exit3" "$TMP_DIR/shim/claude-plain-truncated"
+for shim in claude-json-unrelated claude-json-exit3 claude-plain-truncated; do
+  OUT=$(CLAUDE_BIN="$TMP_DIR/shim/$shim" bash "$VALIDATOR" "$TMP_DIR/no-tools.md" 2>&1); RC=$?
+  if [ $RC -eq 2 ] && has "Frontmatter not verified" && has "Validation incomplete" && ! has "Frontmatter parses"; then
+    pass "$shim: exit 2, frontmatter reported unverified"
+  else
+    flunk "$shim: exit $RC, 'not verified' present: $(has 'Frontmatter not verified' && echo yes || echo no), 'parses' present: $(has 'Frontmatter parses' && echo yes || echo no) (report-shape)"
+  fi
+done
+
 # 10. A Claude Code without --json (older than 2.1.259): the plain report carries the same
 #     verdict. The shim rejects --json the way commander does and otherwise runs the real CLI.
 printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "--json" ] && { echo "error: unknown option '"'"'--json'"'"'" >&2; exit 1; }; done\nexec "%s" "$@"\n' "$CLAUDE" > "$TMP_DIR/shim/claude-nojson"
@@ -504,6 +674,24 @@ if [ $RC -eq 0 ] && has "✅ Frontmatter parses"; then
 else
   flunk "plain report fallback (valid): exit $RC, 'Frontmatter parses' present: $(has 'Frontmatter parses' && echo yes || echo no)"
 fi
+
+# 11. A file larger than the pipe buffer: the readers must consume their input (sigpipe).
+{ printf -- '---\nname: big-agent\ndescription: |-\n  Use this agent when the user asks for X. Examples: <example>Context: c</example>\nmodel: inherit\ncolor: blue\n---\n\n'; printf '%s\n' "$BODY" | awk '{ for (i = 0; i < 800; i++) print }'; } > "$TMP_DIR/big.md"
+big_bytes=$(wc -c < "$TMP_DIR/big.md" | tr -d ' ')
+[ "$big_bytes" -gt 65536 ] || flunk "big.md is only $big_bytes bytes; the check needs more than 65536"
+run "$TMP_DIR/big.md"
+if [ $RC -eq 0 ] && has "Frontmatter properly closed" && has "Frontmatter parses" && has_summary; then
+  pass "file of $big_bytes bytes: exit 0 with a summary"
+else
+  flunk "file of $big_bytes bytes: exit $RC, closed: $(has 'properly closed' && echo yes || echo no), summary: $(has_summary && echo yes || echo no) (sigpipe)"
+fi
+
+# 12. Argument handling: `--` ends the options, and a file name starting with '-' is a file.
+cp "$TMP_DIR/no-tools.md" "$TMP_DIR/-dash.md"
+OUT=$(cd "$TMP_DIR" && bash "$VALIDATOR" -- -dash.md 2>&1); RC=$?
+if [ $RC -eq 0 ] && has "Frontmatter parses"; then pass "-- then a file named -dash.md"; else flunk "-- -dash.md: exit $RC (expected 0)"; fi
+OUT=$(cd "$TMP_DIR" && bash "$VALIDATOR" --description -- -dash.md 2>&1); RC=$?
+if [ $RC -eq 0 ] && has "Use this agent when"; then pass "--description -- -dash.md"; else flunk "--description -- -dash.md: exit $RC, got: $(printf '%s' "$OUT" | head -c 80)"; fi
 
 echo ""
 if [ $fail -eq 0 ]; then
