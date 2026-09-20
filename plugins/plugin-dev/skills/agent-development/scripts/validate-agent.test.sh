@@ -10,8 +10,9 @@
 # Every check names the defect it pins, and each was seen FAILING against a validator that has
 # that defect before it was accepted here:
 #   own-grammar   the script decided parse-ability with an awk classifier of its own. With
-#                 VALIDATOR pointed at PR #89404's script the corpus check below fails on 19 of
-#                 44 shapes, at the previous version of this script on 20 of 44 (Claude Code
+#                 VALIDATOR pointed at PR #89404's script the corpus check below fails on 35 of
+#                 92 shapes, at this script's own-grammar version (e830ff6) on 37 of 92 (Claude
+#                 Code 2.1.278; 19 and 20 of 44 when the corpus had 44 shapes, Claude Code
 #                 2.1.266): false passes (an unterminated quote, a list, a number, a boolean, a
 #                 null), a false error (a tab-indented continuation), and parse failures
 #                 reported in the script's words rather than the product's
