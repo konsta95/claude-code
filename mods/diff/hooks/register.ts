@@ -324,6 +324,7 @@ export function register(on: On) {
 
     const record = Record.recorderOf(engine)
     const pinned = backend
+    const { epoch } = pin
 
     const fetched = (): Promise<Git.FetchOutcome> =>
       pinned
@@ -337,6 +338,10 @@ export function register(on: On) {
         fetched(),
         engine.messages().catch((): SessionMessage[] => []),
       ])
+
+      if (epoch !== pin.epoch) {
+        return
+      }
 
       model = PaneState.afterFetch(model, { outcome, messages })
 
@@ -362,7 +367,7 @@ export function register(on: On) {
 
       const hasHunksFailed = await loadBodies(engine)
 
-      if (outcome.kind === 'data') {
+      if (epoch === pin.epoch && outcome.kind === 'data') {
         record.mark(
           Record.FEATURES.read,
           hasHunksFailed
@@ -379,7 +384,10 @@ export function register(on: On) {
       throw error
     } finally {
       isRefreshing = false
-      redraw(engine)
+
+      if (epoch === pin.epoch) {
+        redraw(engine)
+      }
 
       if (isRefreshQueued) {
         isRefreshQueued = false
@@ -390,12 +398,16 @@ export function register(on: On) {
 
   function scheduleRefresh(engine: Host): void {
     timers.get('refresh')?.cancel()
+    const { epoch } = pin
 
     timers.set(
       'refresh',
       engine.after(Limits.REFRESH_DEBOUNCE_MS, () => {
         timers.delete('refresh')
-        void refresh(engine)
+
+        if (epoch === pin.epoch) {
+          void refresh(engine)
+        }
       }),
     )
   }
@@ -506,7 +518,12 @@ export function register(on: On) {
   }
 
   async function openOnRestore(engine: Host): Promise<void> {
+    const { epoch } = pin
     const messages = await engine.messages().catch((): SessionMessage[] => [])
+
+    if (epoch !== pin.epoch) {
+      return
+    }
 
     hasRestoredEdits = Turns.turnDiffsOf(messages).length > 0
 
@@ -890,6 +907,9 @@ export function register(on: On) {
     }
 
     unpin()
+    timers.get('refresh')?.cancel()
+    timers.delete('refresh')
+    isRefreshQueued = false
     hasAutoOpened = false
     hasRestoredEdits = false
     bodyStamp = null
