@@ -324,6 +324,7 @@ export function register(on: On) {
 
     const record = Record.recorderOf(engine)
     const pinned = backend
+    const { epoch } = pin
 
     const fetched = (): Promise<Git.FetchOutcome> =>
       pinned
@@ -338,17 +339,22 @@ export function register(on: On) {
         engine.messages().catch((): SessionMessage[] => []),
       ])
 
+      if (outcome.kind === 'unavailable') {
+        record.mark(Record.FEATURES.read, {
+          kind: 'sad',
+          reason: 'git_diff_failed',
+        })
+      }
+
+      if (epoch !== pin.epoch) {
+        return
+      }
+
       model = PaneState.afterFetch(model, { outcome, messages })
 
       switch (outcome.kind) {
         case 'no-repository':
-          break
         case 'unavailable':
-          record.mark(Record.FEATURES.read, {
-            kind: 'sad',
-            reason: 'git_diff_failed',
-          })
-
           break
         case 'data':
           generation += 1
@@ -362,7 +368,7 @@ export function register(on: On) {
 
       const hasHunksFailed = await loadBodies(engine)
 
-      if (outcome.kind === 'data') {
+      if (outcome.kind === 'data' && (hasHunksFailed || epoch === pin.epoch)) {
         record.mark(
           Record.FEATURES.read,
           hasHunksFailed
@@ -379,7 +385,10 @@ export function register(on: On) {
       throw error
     } finally {
       isRefreshing = false
-      redraw(engine)
+
+      if (epoch === pin.epoch) {
+        redraw(engine)
+      }
 
       if (isRefreshQueued) {
         isRefreshQueued = false
@@ -404,6 +413,7 @@ export function register(on: On) {
     engine: Host,
     trigger: (typeof Record.SHOWN_TRIGGERS)[number],
   ): Promise<boolean> {
+    const { epoch } = pin
     const isDialog = model.isFullscreen === false
 
     model = {
@@ -419,6 +429,10 @@ export function register(on: On) {
 
     if (!isDialog) {
       await refresh(engine).catch(() => undefined)
+    }
+
+    if (epoch !== pin.epoch) {
+      return false
     }
 
     const opened = await engine.openPane(
@@ -466,7 +480,8 @@ export function register(on: On) {
   }
 
   async function openOnFirstEdit(engine: Host): Promise<void> {
-    const isTaken = () => isPaneOpen || hasAutoOpened
+    const { epoch } = pin
+    const isTaken = () => epoch !== pin.epoch || isPaneOpen || hasAutoOpened
 
     if (isTaken()) {
       return
@@ -502,11 +517,20 @@ export function register(on: On) {
     }
 
     hasAutoOpened = true
-    hasAutoOpened = await openPane(engine, 'auto_open')
+    const opened = await openPane(engine, 'auto_open')
+
+    if (epoch === pin.epoch) {
+      hasAutoOpened = opened
+    }
   }
 
   async function openOnRestore(engine: Host): Promise<void> {
+    const { epoch } = pin
     const messages = await engine.messages().catch((): SessionMessage[] => [])
+
+    if (epoch !== pin.epoch) {
+      return
+    }
 
     hasRestoredEdits = Turns.turnDiffsOf(messages).length > 0
 
@@ -771,13 +795,18 @@ export function register(on: On) {
     }
 
     const isOpening = toggle === 'open'
+    const { epoch } = pin
 
     const isDone = isOpening
       ? await openPane(host, 'manual')
       : await closePane(host).then(() => true)
 
     if (!isDone) {
-      return { text: Names.RESIZE_TERMINAL_TEXT }
+      return {
+        text: epoch !== pin.epoch
+          ? Names.SESSION_CHANGED_TEXT
+          : Names.RESIZE_TERMINAL_TEXT,
+      }
     }
 
     if (!isFullscreen) {
@@ -890,6 +919,9 @@ export function register(on: On) {
     }
 
     unpin()
+    timers.get('refresh')?.cancel()
+    timers.delete('refresh')
+    isRefreshQueued = false
     hasAutoOpened = false
     hasRestoredEdits = false
     bodyStamp = null
