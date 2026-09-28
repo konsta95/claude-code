@@ -49,7 +49,10 @@ export function register(on: On) {
   let backend: Backend.Backend | null = null
   let probing: Promise<boolean> | null = null
   let sessionStartMs = 0
+  let sessionStartReady: Promise<void> = Promise.resolve()
   let isPaneOpen = false
+  let openingPane: Promise<boolean> | null = null
+  let paneCloses = 0
   let dialogRows: number | null = null
   let hasAutoOpened = false
   let hasRestoredEdits = false
@@ -321,6 +324,8 @@ export function register(on: On) {
     engine: Host,
     pinned: Backend.Backend | null,
   ): Promise<PaneState.Fetched> {
+    await sessionStartReady
+
     const fetched = (): Promise<Git.FetchOutcome> =>
       pinned
         ? pinned.fetchDiff(model.requestedMode)
@@ -426,15 +431,40 @@ export function register(on: On) {
     )
   }
 
-  async function openPane(
+  function openPane(
     engine: Host,
     trigger: (typeof Record.SHOWN_TRIGGERS)[number],
     read: PaneState.Fetched | null = null,
   ): Promise<boolean> {
     const { epoch } = pin
-    const isDialog = model.isFullscreen === false
-
     opens += 1
+
+    const opening = (openingPane ?? Promise.resolve(false))
+      .catch(() => false)
+      .then(() => {
+        if (epoch !== pin.epoch) {
+          return false
+        }
+
+        return isPaneOpen || placePane(engine, trigger, read)
+      })
+
+    openingPane = opening
+
+    return opening.finally(() => {
+      if (openingPane === opening) {
+        openingPane = null
+      }
+    })
+  }
+
+  async function placePane(
+    engine: Host,
+    trigger: (typeof Record.SHOWN_TRIGGERS)[number],
+    read: PaneState.Fetched | null,
+  ): Promise<boolean> {
+    const { epoch } = pin
+    const isDialog = model.isFullscreen === false
 
     model = {
       ...model,
@@ -465,6 +495,29 @@ export function register(on: On) {
 
     const isWaiting = isRecord(opened) && opened.isPlaced === false
 
+    if (epoch !== pin.epoch) {
+      const closedBefore = paneCloses
+
+      try {
+        await engine.closePane({ id: Names.PANE_ID })
+      } catch (error) {
+        engine.uiLog(
+          `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(error))}`,
+        )
+
+        if (!isWaiting && paneCloses === closedBefore) {
+          isPaneOpen = true
+          await pinBackend(engine).catch(() => false)
+
+          if (isPaneOpen) {
+            await refresh(engine).catch(() => undefined)
+          }
+        }
+      }
+
+      return isPaneOpen
+    }
+
     if (isWaiting) {
       await engine.closePane({ id: Names.PANE_ID }).catch(() => undefined)
 
@@ -474,6 +527,10 @@ export function register(on: On) {
     isPaneOpen = true
 
     const sessionId = await engine.sessionId().catch(() => null)
+
+    if (epoch !== pin.epoch) {
+      return isPaneOpen
+    }
 
     if (sessionId !== null && sessionId !== shownSessionId) {
       shownSessionId = sessionId
@@ -735,6 +792,17 @@ export function register(on: On) {
     return typeof startedAt === 'number' ? startedAt : null
   }
 
+  async function resetSessionStart(engine: Host, isResume: boolean): Promise<void> {
+    const { epoch } = pin
+    const startedAt =
+      (await startedAtOf(engine)) ??
+      (isResume ? sessionStartMs : await engine.now())
+
+    if (epoch === pin.epoch) {
+      sessionStartMs = startedAt
+    }
+  }
+
   async function bind(engine: Host, cwd: string): Promise<void> {
     sessionStartMs = (await startedAtOf(engine)) ?? (await engine.now())
     pin.cwd = cwd
@@ -931,6 +999,7 @@ export function register(on: On) {
     const isPersons = isClosed && e.origin.kind === 'person'
 
     if (isClosed) {
+      paneCloses += 1
       isPaneOpen = false
     }
 
@@ -1017,9 +1086,14 @@ export function register(on: On) {
     disarm(host)
     model = PaneState.afterNewSession(model)
 
-    sessionStartMs =
-      (await startedAtOf(host)) ??
-      (isResume ? sessionStartMs : await host.now())
+    const { epoch } = pin
+    const starting = resetSessionStart(host, isResume)
+    sessionStartReady = starting.catch(() => undefined)
+    await starting
+
+    if (epoch !== pin.epoch) {
+      return result
+    }
 
     if (isKeptOpen) {
       await pinBackend(host)

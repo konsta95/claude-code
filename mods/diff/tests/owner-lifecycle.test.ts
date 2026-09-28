@@ -34,7 +34,7 @@ const RECORDING: Plugin = {
   },
 }
 
-function lifecycleWorld(on: On) {
+function lifecycleWorld(on: On, stored: Record<string, unknown> = {}) {
   const script: Record<string, string> = { ...Fixtures.REPOSITORY }
   const state = {
     delayRead: 0,
@@ -43,16 +43,25 @@ function lifecycleWorld(on: On) {
     delaySettings: 0,
     delayBody: 0,
     delayOpen: 0,
+    delayClose: 0,
+    delaySessionId: 0,
+    delayUsage: 0,
+    startedAt: 0,
     failRead: false,
     failBody: false,
+    failOpen: false,
+    denyClose: false,
     transcript: [] as readonly SessionMessage[],
   }
   const clock = Fixtures.startsSession(on)
   const opened: { id: string }[] = []
   const closed: { id: string }[] = []
+  const pane = { visible: false }
   const reads: string[] = []
   const counts = { messages: 0, preferences: 0, settings: 0, bodies: 0 }
   const marks: string[] = []
+  const logs: string[] = []
+  const preferences: unknown[] = []
 
   on('process.run', async (_engine, e) => {
     const line = e.argv.join(' ')
@@ -93,7 +102,15 @@ function lifecycleWorld(on: On) {
     if (delay > 0) await clock.sleep(delay)
     return { value }
   })
-  on('session.usage', () => ({ value: Fixtures.usageAt(0) }))
+  on('session.usage', async () => {
+    const startedAt = state.startedAt
+    if (state.delayUsage > 0) await clock.sleep(state.delayUsage)
+    return { value: Fixtures.usageAt(startedAt) }
+  })
+  on('session.id', async () => {
+    if (state.delaySessionId > 0) await clock.sleep(state.delaySessionId)
+    return { value: 'test-session' }
+  })
   on('command.run', { command: ['clear', 'resume'] }, () => ({}))
   on('tool.call', (_$, e) =>
     e.tool === 'Bash' && e.command === 'ls'
@@ -102,10 +119,21 @@ function lifecycleWorld(on: On) {
   )
   on('ui.open', async (_engine, e) => {
     opened.push({ id: e.id })
+    const fails = state.failOpen
     if (state.delayOpen > 0) await clock.sleep(state.delayOpen)
+    if (fails) throw new Error('test placement failed')
+    pane.visible = true
     return { value: undefined }
   })
-  on('ui.close', (_engine, e) => { closed.push({ id: e.id }); return { value: undefined } })
+  on('ui.close', async (_engine, e) => {
+    closed.push({ id: e.id })
+    const denied = state.denyClose
+    state.denyClose = false
+    if (state.delayClose > 0) await clock.sleep(state.delayClose)
+    if (denied) return { deny: 'test close denied' }
+    pane.visible = false
+    return { value: undefined }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('ui.invalidate', () => ({ value: undefined }))
   on('ui.render', { component: 'PromptHint' }, () => Fixtures.HINT_DRAWN)
@@ -116,6 +144,9 @@ function lifecycleWorld(on: On) {
   })
   on('store.*', async ($, e, next) => {
     const result = await next(e)
+    if (next.is('store.set', e) && e.key === Names.STORE_OPEN_KEY) {
+      preferences.push(e.value)
+    }
     if (next.is('store.get', e) && e.key === Names.STORE_OPEN_KEY) {
       counts.preferences += 1
       if (state.delayPreference > 0) await clock.sleep(state.delayPreference)
@@ -123,6 +154,7 @@ function lifecycleWorld(on: On) {
     return result
   })
   on('ui.log', ($, e) => {
+    if (!e.text.startsWith('mark ')) logs.push(e.text)
     if (e.text.startsWith('mark ')) {
       const mark = JSON.parse(e.text.slice(5))
       if (mark.feature === 'repl_diff_read') {
@@ -131,13 +163,338 @@ function lifecycleWorld(on: On) {
     }
     return { value: undefined }
   })
-  mock.store(on, {})
+  mock.store(on, stored)
   mock.env(on, {})
 
-  return { clock, opened, closed, script, state, reads, counts, marks }
+  return { clock, opened, closed, pane, script, state, reads, counts, marks, logs, preferences }
+}
+
+function filesWrittenAt(on: On, mtimeMs: number) {
+  on('fs.list', () => ({
+    value: [
+      { name: 'app.ts', kind: 'file', size: 2, isLink: false },
+      { name: 'other.ts', kind: 'file', size: 2, isLink: false },
+    ],
+  }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: 2, mtimeMs, isLink: false } }))
 }
 
 describe('owner-lifecycle', () => {
+  for (const command of ['clear', 'resume'] as const) {
+    for (const path of ['manual', 'auto'] as const) {
+      test(`denied ${path} cleanup waits for /${command} session timing before dating files`, async ($, on) => {
+        const world = lifecycleWorld(on)
+        filesWrittenAt(on, 2000)
+        world.state.startedAt = 100
+        await $.session.start(Fixtures.SESSION)
+        await $.ui.render(Fixtures.HINT)
+        await world.clock.advance(5000)
+        world.state.delayOpen = 1000
+        const opening = path === 'manual'
+          ? $.command.run(Fixtures.DIFF)
+          : $.tool.call({
+              tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+            })
+        await world.clock.settle()
+        expect(world.opened).toHaveLength(1)
+
+        Object.assign(world.script, MOVED)
+        world.state.startedAt = 5000
+        world.state.delayUsage = 3000
+        world.state.denyClose = true
+        const changing = $.command.run(command === 'clear' ? Fixtures.CLEAR : Fixtures.RESUME)
+        await world.clock.advance(1500)
+        world.state.delayUsage = 0
+        await world.clock.advance(3000)
+        await changing
+        await opening
+        await world.clock.advance(Fixtures.SETTLE_MS)
+
+        expect(world.logs.join('\n')).toContain('test close denied')
+        expect(world.pane.visible).toBe(true)
+        const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+        expect(text).toContain('No changes this session')
+        expect(text).toContain('1 file edited before this session')
+      })
+    }
+  }
+
+  test('a kept-open pane waits for clear session timing before dating files', async ($, on) => {
+    const world = lifecycleWorld(on)
+    filesWrittenAt(on, 2000)
+    world.state.startedAt = 100
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIFF)
+    await world.clock.advance(5000)
+    Object.assign(world.script, MOVED)
+    world.state.startedAt = 5000
+    world.state.delayUsage = 3000
+    const clearing = $.command.run(Fixtures.CLEAR)
+    await world.clock.advance(4000)
+    await clearing
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    expect(world.pane.visible).toBe(true)
+    const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+    expect(text).toContain('No changes this session')
+    expect(text).toContain('1 file edited before this session')
+  })
+
+  test('an older clear cannot overwrite a newer session start', async ($, on) => {
+    const world = lifecycleWorld(on)
+    filesWrittenAt(on, 6000)
+    world.state.startedAt = 100
+    await $.session.start(Fixtures.SESSION)
+    await world.clock.advance(5000)
+    world.state.startedAt = 5000
+    world.state.delayUsage = 3000
+    const older = $.command.run(Fixtures.CLEAR)
+    await world.clock.advance(2000)
+    world.state.startedAt = 7000
+    world.state.delayUsage = 0
+    await $.command.run(Fixtures.CLEAR)
+    await world.clock.advance(2000)
+    await older
+    Object.assign(world.script, MOVED)
+    expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+    expect(text).toContain('No changes this session')
+    expect(text).toContain('1 file edited before this session')
+  })
+
+  test('clear during a manual open preserves the shown reply and open preference', async ($, on) => {
+    const world = lifecycleWorld(on, { [Names.STORE_OPEN_KEY]: false })
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    await world.clock.settle()
+    world.state.delaySessionId = 1000
+    const opening = $.command.run(Fixtures.DIFF)
+    await world.clock.settle()
+    expect(world.pane.visible).toBe(true)
+    await $.command.run(Fixtures.CLEAR)
+    world.state.delaySessionId = 0
+    await world.clock.advance(3000)
+
+    expect(await opening).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+    expect(world.preferences).toEqual([true])
+    expect(world.pane.visible).toBe(true)
+    expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+    expect(world.pane.visible).toBe(false)
+  })
+
+  for (const path of ['manual', 'auto'] as const) {
+    test(`a denied stale ${path} cleanup reports the failure and refreshes the retained pane`, async ($, on) => {
+      const world = lifecycleWorld(on)
+      await $.session.start(Fixtures.SESSION)
+      await $.ui.render(Fixtures.HINT)
+      await world.clock.settle()
+      world.state.delayOpen = 1000
+      const opening = (path === 'manual'
+        ? $.command.run(Fixtures.DIFF)
+        : $.tool.call({
+            tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+          })).then(
+            reply => ({ reply }),
+            (error: unknown) => ({ error: String(error) }),
+          )
+      await world.clock.settle()
+      expect(world.opened).toHaveLength(1)
+      await $.command.run(Fixtures.CLEAR)
+      Object.assign(world.script, MOVED)
+      world.state.delayOpen = 0
+      world.state.denyClose = true
+      await world.clock.advance(3000)
+      const outcome = await opening
+
+      expect(outcome).toHaveProperty('reply')
+      if (path === 'manual') {
+        expect(outcome).toEqual({ reply: { text: Names.PANEL_SHOWN_TEXT } })
+      }
+      expect(world.logs.join('\n')).toContain('test close denied')
+      expect(world.pane.visible).toBe(true)
+      const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+      expect(text).toContain('other.ts')
+      expect(text).not.toContain('app.ts')
+      expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+      expect(world.pane.visible).toBe(false)
+    })
+  }
+
+  test('a rejected old placement does not prevent the new session from opening', async ($, on) => {
+    const world = lifecycleWorld(on)
+    await $.session.start(Fixtures.SESSION)
+    world.state.delayOpen = 1000
+    world.state.failOpen = true
+    const old = $.command.run(Fixtures.DIFF).then(() => 'resolved', () => 'rejected')
+    await world.clock.settle()
+    expect(world.opened).toHaveLength(1)
+    await $.command.run(Fixtures.CLEAR)
+    Object.assign(world.script, MOVED)
+    world.state.delayOpen = 0
+    world.state.failOpen = false
+    const current = $.command.run(Fixtures.DIFF)
+    await world.clock.advance(3000)
+
+    expect(await old, 'the original caller still sees its failure').toBe('rejected')
+    expect(await current).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+    expect(world.pane.visible).toBe(true)
+    expect(Fixtures.textOf(await $.ui.render(Fixtures.PANE))).toContain('other.ts')
+  })
+
+  test('a second session change cancels a placement waiting behind the first', async ($, on) => {
+    const world = lifecycleWorld(on)
+    await $.session.start(Fixtures.SESSION)
+    world.state.delayOpen = 1000
+    const old = $.command.run(Fixtures.DIFF)
+    await world.clock.settle()
+    expect(world.opened).toHaveLength(1)
+    await $.command.run(Fixtures.CLEAR)
+    world.state.delayOpen = 0
+    const middle = $.command.run(Fixtures.DIFF)
+    await world.clock.settle()
+    await $.command.run(Fixtures.RESUME)
+    Object.assign(world.script, MOVED)
+    const current = $.command.run(Fixtures.DIFF)
+    await world.clock.advance(3000)
+
+    expect(await old).toEqual({ text: Names.SESSION_CHANGED_TEXT })
+    expect(await middle).toEqual({ text: Names.SESSION_CHANGED_TEXT })
+    expect(await current).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+    expect(world.opened, 'the ended middle session never places a pane').toHaveLength(2)
+    expect(world.closed).toHaveLength(1)
+    expect(world.pane.visible).toBe(true)
+    expect(Fixtures.textOf(await $.ui.render(Fixtures.PANE))).toContain('other.ts')
+  })
+
+  for (const command of ['clear', 'resume'] as const) {
+    for (const path of ['manual', 'auto'] as const) {
+      test(`/${command} during ${path} pane session identification preserves current pane state and data`, async ($, on) => {
+        const world = lifecycleWorld(on)
+        await $.session.start(Fixtures.SESSION)
+        await $.ui.render(Fixtures.HINT)
+        await world.clock.settle()
+        world.state.delaySessionId = 1000
+        const opening = path === 'manual'
+          ? $.command.run(Fixtures.DIFF)
+          : $.tool.call({
+              tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+            })
+        await world.clock.settle()
+        expect(world.pane.visible, 'the pane has been placed').toBe(true)
+        expect(world.reads).toHaveLength(1)
+
+        Object.assign(world.script, MOVED)
+        await $.command.run(command === 'clear' ? Fixtures.CLEAR : Fixtures.RESUME)
+        world.state.delaySessionId = 0
+        await world.clock.advance(3000)
+        const reply = await opening
+        if (path === 'manual') {
+          expect(reply).toEqual({
+            text: command === 'clear' ? Names.PANEL_SHOWN_TEXT : Names.SESSION_CHANGED_TEXT,
+          })
+        }
+        expect(world.pane.visible).toBe(command === 'clear')
+        if (command === 'clear') {
+          const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+          expect(text).toContain('other.ts')
+          expect(text).not.toContain('app.ts')
+        } else {
+          expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+          await world.clock.advance(Fixtures.SETTLE_MS)
+          const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+          expect(text).toContain('other.ts')
+          expect(text).not.toContain('app.ts')
+        }
+      })
+    }
+  }
+
+  for (const command of ['clear', 'resume'] as const) {
+    for (const path of ['manual', 'auto'] as const) {
+      test(`the new ${path} pane survives an old placement and its cleanup after /${command}`, async ($, on) => {
+        const world = lifecycleWorld(on)
+        await $.session.start(Fixtures.SESSION)
+        await $.ui.render(Fixtures.HINT)
+        await world.clock.settle()
+        world.state.delayOpen = 1000
+        const old = $.command.run(Fixtures.DIFF)
+        await world.clock.settle()
+        expect(world.opened).toHaveLength(1)
+        expect(world.pane.visible).toBe(false)
+
+        Object.assign(world.script, MOVED)
+        await $.command.run(command === 'clear' ? Fixtures.CLEAR : Fixtures.RESUME)
+        world.state.delayOpen = 0
+        world.state.delayClose = 1000
+        const current = path === 'manual'
+          ? $.command.run(Fixtures.DIFF)
+          : $.tool.call({
+              tool: 'Edit', file_path: '/work/other.ts', old_string: '1', new_string: '2',
+            })
+        await world.clock.advance(4000)
+        const oldReply = await old
+        const currentReply = await current
+        expect(world.pane.visible, 'old cleanup cannot remove the new pane').toBe(true)
+        const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+        expect(text).toContain('other.ts')
+        expect(text).not.toContain('app.ts')
+        expect(oldReply).toEqual({ text: Names.SESSION_CHANGED_TEXT })
+        expect(world.closed.map(pane => pane.id), 'the old placement was removed').toEqual(['diff'])
+        if (path === 'manual') {
+          expect(currentReply).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+        }
+
+        world.state.delayClose = 0
+        expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+        expect(world.pane.visible).toBe(false)
+      })
+    }
+  }
+
+  for (const command of ['clear', 'resume'] as const) {
+    for (const path of ['manual', 'auto'] as const) {
+      test(`/${command} during ${path} pane placement removes the ended session pane`, async ($, on) => {
+        const world = lifecycleWorld(on)
+        await $.session.start(Fixtures.SESSION)
+        await $.ui.render(Fixtures.HINT)
+        await world.clock.settle()
+        world.state.delayOpen = 1000
+
+        const opening = path === 'manual'
+          ? $.command.run(Fixtures.DIFF)
+          : $.tool.call({
+              tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+            })
+        await world.clock.settle()
+        expect(world.opened, 'placement was requested').toHaveLength(1)
+        expect(world.pane.visible, 'placement has not completed').toBe(false)
+        expect(world.reads).toHaveLength(1)
+
+        Object.assign(world.script, MOVED)
+        await $.command.run(command === 'clear' ? Fixtures.CLEAR : Fixtures.RESUME)
+        world.state.delayOpen = 0
+        await world.clock.advance(3000)
+        const reply = await opening
+
+        expect(world.pane.visible, 'the ended session cannot leave a pane behind').toBe(false)
+        expect(world.closed.map(pane => pane.id)).toEqual(['diff'])
+        expect(world.reads, 'discarding the old placement does not read again').toHaveLength(1)
+        if (path === 'manual') {
+          expect(reply).toEqual({ text: Names.SESSION_CHANGED_TEXT })
+        }
+
+        expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+        await world.clock.advance(Fixtures.SETTLE_MS)
+        expect(world.pane.visible).toBe(true)
+        const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+        expect(text).toContain('other.ts')
+        expect(text).not.toContain('app.ts')
+      })
+    }
+  }
+
   for (const command of ['clear', 'resume'] as const) {
     test(`/${command} during the first manual /diff read asks for another /diff and leaves no pane`, async ($, on) => {
       const world = lifecycleWorld(on)
