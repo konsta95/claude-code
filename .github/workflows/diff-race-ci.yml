@@ -1,0 +1,45 @@
+name: "Diff race regression"
+
+on:
+  push:
+    branches:
+      - "fix/diff-pending-pane-races-01a0e7e9"
+  pull_request:
+    paths:
+      - "mods/**"
+      - ".github/workflows/diff-race-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  diff-regression:
+    name: Diff tests and mod typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Claude Code and TypeScript
+        run: |
+          npm install -g @anthropic-ai/claude-code@2.1.284 typescript@5.9.3
+          claude --version
+          tsc --version
+
+      - name: Typecheck every mod's hooks and tests
+        run: tsc -p mods/tsconfig.json
+
+      - name: Run the complete diff regression suite
+        shell: bash
+        run: |
+          test -s mods/diff/tests/owner-lifecycle.test.ts
+          test_help=$(claude plugin test --help)
+          if [[ "$test_help" != "Usage: claude plugin test"* ]]; then
+            echo "The pinned Claude Code must provide 'plugin test'; refusing to skip tests" >&2
+            exit 1
+          fi
+          claude plugin test mods/diff
+        env:
+          CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: "1"
