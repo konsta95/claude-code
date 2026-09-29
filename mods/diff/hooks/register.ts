@@ -1067,11 +1067,23 @@ export function register(on: On) {
     }
 
     const isResume = e.command === 'resume'
-    const isKeptOpen = isPaneOpen && !isResume
+    const epochBeforeClose = pin.epoch
 
     if (isPaneOpen && isResume) {
-      await closePane(host).catch(() => undefined)
+      try {
+        await closePane(host)
+      } catch (error) {
+        host.uiLog(
+          `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(error))}`,
+        )
+      }
     }
+
+    if (epochBeforeClose !== pin.epoch) {
+      return result
+    }
+
+    const isKeptOpen = isPaneOpen
 
     unpin()
     timers.get('refresh')?.cancel()

@@ -653,6 +653,124 @@ describe('owner-lifecycle', () => {
     expect(world.opened.map(pane => pane.id)).toEqual(['diff'])
   })
 
+  test('/resume refreshes a retained pane when its close is denied and restored history has no edits', async ($, on) => {
+    const world = lifecycleWorld(on)
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    expect(Fixtures.textOf(await $.ui.render(Fixtures.PANE))).toContain('app.ts')
+
+    Object.assign(world.script, MOVED)
+    world.state.denyClose = true
+    await $.command.run(Fixtures.RESUME)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    expect(world.pane.visible).toBe(true)
+    const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+    expect(text).toContain('other.ts')
+    expect(text).not.toContain('app.ts')
+    expect(world.opened).toHaveLength(1)
+    expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+    expect(world.pane.visible).toBe(false)
+  })
+
+  test('/resume reports a denied close and reuses the retained pane for restored edits', async ($, on) => {
+    const world = lifecycleWorld(on)
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    Object.assign(world.script, MOVED)
+    world.state.transcript = Fixtures.EDITED_TRANSCRIPT
+    world.state.denyClose = true
+    await $.command.run(Fixtures.RESUME)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    expect(world.logs.join('\n')).toContain('test close denied')
+    expect(world.pane.visible).toBe(true)
+    expect(world.opened).toHaveLength(1)
+    expect(world.closed).toHaveLength(1)
+    const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+    expect(text).toContain('other.ts')
+    expect(text).not.toContain('app.ts')
+  })
+
+  test('/resume waits for its session timing before refreshing a pane whose close was denied', async ($, on) => {
+    const world = lifecycleWorld(on)
+    filesWrittenAt(on, 2000)
+    world.state.startedAt = 100
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIFF)
+    await world.clock.advance(5000)
+    const before = world.reads.length
+
+    Object.assign(world.script, MOVED)
+    world.state.startedAt = 5000
+    world.state.delayUsage = 2000
+    world.state.denyClose = true
+    const resuming = $.command.run(Fixtures.RESUME)
+    await world.clock.settle()
+    expect(world.reads).toHaveLength(before)
+    await world.clock.advance(3000)
+    await resuming
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+    expect(text).toContain('No changes this session')
+    expect(text).toContain('1 file edited before this session')
+  })
+
+  test('a delayed denied resume close does not revive a pane closed by a later request', async ($, on) => {
+    const world = lifecycleWorld(on)
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const before = world.reads.length
+    world.state.delayClose = 1000
+    world.state.denyClose = true
+    const resuming = $.command.run(Fixtures.RESUME)
+    await world.clock.settle()
+    expect(world.closed).toHaveLength(1)
+
+    world.state.delayClose = 0
+    expect(await $.command.run(Fixtures.DIFF)).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+    await world.clock.advance(2000)
+    await resuming
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    expect(world.pane.visible).toBe(false)
+    expect(world.opened).toHaveLength(1)
+    expect(world.reads.slice(before)).toEqual([])
+  })
+
+  test('an older denied resume close cannot reset a newer clear or discard its refresh', async ($, on) => {
+    const world = lifecycleWorld(on)
+    filesWrittenAt(on, 2000)
+    world.state.startedAt = 100
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIFF)
+    await world.clock.advance(5000)
+    world.state.delayClose = 1000
+    world.state.denyClose = true
+    const resuming = $.command.run(Fixtures.RESUME)
+    await world.clock.settle()
+    expect(world.closed).toHaveLength(1)
+
+    world.state.delayClose = 0
+    world.state.delayRead = 2000
+    world.state.startedAt = 5000
+    Object.assign(world.script, MOVED)
+    await $.command.run(Fixtures.CLEAR)
+    await world.clock.advance(4000)
+    await resuming
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    expect(world.pane.visible).toBe(true)
+    const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+    expect(text).toContain('No changes this session')
+    expect(text).toContain('1 file edited before this session')
+  })
+
   test('/resume consumes a pending refresh when restored history has no edits', async ($, on) => {
     const world = lifecycleWorld(on)
     await $.session.start(Fixtures.SESSION)
