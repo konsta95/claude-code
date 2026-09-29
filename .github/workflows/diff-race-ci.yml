@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "fix/diff-pending-pane-races-01a0e7e9"
+      - "fix/diff-resume-denied-close-01a0e7e9"
   pull_request:
     paths:
       - "mods/**"
