@@ -19,7 +19,7 @@ import { isOnPaneSurface } from './is-on-pane-surface'
 import { isOutsideWorkingTree } from './is-outside-working-tree'
 import { isRecord } from './is-record'
 import Limits from './limits'
-import { mapLimited } from './map-limited'
+import { Lifecycle } from './lifecycle'
 import { messageOf } from './message-of'
 import { mtimeOf } from './mtime-of'
 import Names from './names'
@@ -47,52 +47,77 @@ import Views from './views'
 export function register(on: On) {
   let host: Host | null = null
   let backend: Backend.Backend | null = null
-  let probing: Promise<boolean> | null = null
   let sessionStartMs = 0
-  let sessionStartReady: Promise<void> = Promise.resolve()
+  let sessionStartReady: Promise<boolean> = Promise.resolve(true)
+  type SessionChange = {
+    owner: ReturnType<Lifecycle['owner']>
+    endedId: string
+    reason: 'clear' | 'resume'
+    phase: 'pending' | 'initializing' | 'unavailable' | 'ready'
+    requested: number
+    attempted: number
+    release: (ready: boolean) => void
+  }
+  let sessionChange: SessionChange | null = null
   let isPaneOpen = false
   let openingPane: Promise<boolean> | null = null
   let paneCloses = 0
   let dialogRows: number | null = null
   let hasAutoOpened = false
   let hasRestoredEdits = false
-  let isAutoOpening = false
   let landed = 0
   let opens = 0
   let columns: number | null = null
   let shownSessionId: string | null = null
+  let paneTrigger: (typeof Record.SHOWN_TRIGGERS)[number] | null = null
   let armed: Ask.ArmedAsk | null = null
   let carrying: Ask.ArmedAsk | null = null
-  let isRefreshing = false
-  let isRefreshQueued = false
+  let queuedRefresh: {
+    owner: ReturnType<Lifecycle['owner']>
+    engine: Host
+    read: PaneState.Fetched | null
+  } | null = null
   let generation = 0
   let bodyStamp: string | null = null
   let bodyBase: string | null = null
 
-  const bodyLoads = new Map<string, Promise<Git.FileHunks | null>>()
+  const bodyLoads = new Map<string, Promise<Git.FileHunks | null | undefined>>()
 
   const polled = { toplevel: '', headKey: '' }
-  const pin = { cwd: '', isEmpty: false, epoch: 0 }
+  const lifecycle = new Lifecycle(2, kind => {
+    host?.uiLog(kind === 'pane-close' || kind === 'pane-cleanup'
+      ? 'The diff panel is waiting for an earlier pane operation to finish.'
+      : 'The diff panel is waiting for earlier work to finish; it will refresh when that work settles.')
+  }, Limits.BODY_FETCH_CONCURRENCY)
+  const pin = {
+    cwd: '',
+    isEmpty: false,
+    get epoch() { return lifecycle.owner().session },
+  }
 
   let model: PaneState.PaneModel = PaneState.INITIAL_MODEL
 
   const timers = new Map<'refresh' | 'redraw' | 'poll', Timer>()
   const loggedBaseKinds = new Set<'ok' | 'sad'>()
 
-  const currentOf = (engine: Host): Host => host ?? engine
-
-  const backendHostOf = (engine: Host): Backend.BackendHost => ({
+  const backendHostOf = (
+    engine: Host,
+    owner: ReturnType<Lifecycle['owner']>,
+    cwd: string,
+    startedAt: number,
+  ): Backend.BackendHost => ({
     run: (argv, init) =>
-      currentOf(engine).run(
+      engine.run(
         argv,
-        pin.cwd === '' ? init : { cwd: pin.cwd, ...init },
+        cwd === '' ? init : { cwd, ...init },
       ),
-    readFile: path => currentOf(engine).readFile(path),
-    mtimeOf: path => mtimeOf(currentOf(engine))(path),
-    entryKindsOf: dir => entryKindsOf(currentOf(engine))(dir),
-    nowMs: () => currentOf(engine).now(),
-    sessionStartMsOf: () => sessionStartMs,
+    readFile: path => engine.readFile(path),
+    mtimeOf: path => mtimeOf(engine)(path),
+    entryKindsOf: dir => entryKindsOf(engine)(dir),
+    nowMs: () => engine.now(),
+    sessionStartMsOf: () => startedAt,
     onBranchBase: base => {
+      if (!lifecycle.isSession(owner)) return
       const isError = base.kind === 'error'
 
       const outcome: Record.MarkOutcome = isError
@@ -107,7 +132,7 @@ export function register(on: On) {
       if (!loggedBaseKinds.has(outcome.kind)) {
         loggedBaseKinds.add(outcome.kind)
 
-        Record.recorderOf(currentOf(engine)).mark(
+        Record.recorderOf(engine).mark(
           Record.FEATURES.baseResolve,
           outcome,
         )
@@ -115,22 +140,24 @@ export function register(on: On) {
     },
   })
 
-  function pinBackend(engine: Host): Promise<boolean> {
+  async function pinBackend(engine: Host): Promise<boolean> {
+    requestSessionConfirmation(engine)
     if (backend || pin.isEmpty) {
       return Promise.resolve(true)
     }
 
-    probing ??= probeBackend(engine).finally(() => {
-      probing = null
-    })
-
-    return probing
+    const owner = lifecycle.owner()
+    return (await lifecycle.run('probe', owner, () => probeBackend(engine, owner))) ?? false
   }
 
-  async function probeBackend(engine: Host): Promise<boolean> {
+  async function probeBackend(
+    engine: Host,
+    owner: ReturnType<Lifecycle['owner']>,
+  ): Promise<boolean> {
     const asked = { isAnswered: true }
-    const probeHost = backendHostOf(engine)
-    const { epoch } = pin
+    const cwd = pin.cwd
+    if (!(await waitForSessionStart(engine, owner))) return false
+    const probeHost = backendHostOf(engine, owner, cwd, sessionStartMs)
 
     const probed = await Backend.backendOf(
       {
@@ -146,15 +173,13 @@ export function register(on: On) {
       Backend.INSTALLED_BACKEND_PROBES,
     )
 
-    if (epoch !== pin.epoch) {
+    if (!lifecycle.isCurrent(owner)) {
       return false
     }
 
-    backend ??= probed
-    pin.isEmpty = backend === null && asked.isAnswered
-
-    if (!probed || backend !== probed) {
-      return asked.isAnswered || backend !== null
+    if (!probed) {
+      pin.isEmpty = asked.isAnswered
+      return asked.isAnswered
     }
 
     const stored = PaneState.baseModeOf(
@@ -162,6 +187,9 @@ export function register(on: On) {
         .storeGet(Names.baseStoreKeyOf(probed.repository.toplevel))
         .catch(() => undefined),
     )
+
+    if (!lifecycle.isCurrent(owner)) return false
+    backend = probed
 
     const mode = stored && probed.baseModes.includes(stored) ? stored : null
 
@@ -178,7 +206,8 @@ export function register(on: On) {
   function unpin() {
     backend = null
     pin.isEmpty = false
-    pin.epoch += 1
+    lifecycle.advance(true)
+    queuedRefresh = null
     polled.toplevel = ''
     polled.headKey = ''
     timers.get('poll')?.cancel()
@@ -228,6 +257,7 @@ export function register(on: On) {
     const pinned = backend
 
     if (!data || !pinned) {
+      lifecycle.clearBodies()
       bodyStamp = null
       bodyBase = null
       bodyLoads.clear()
@@ -253,7 +283,10 @@ export function register(on: On) {
     return fetchBodies(engine, pinned, data)
   }
 
-  const bodyStampOf = (data: Git.DiffData) => `${generation}|${data.baseRef}`
+  const bodyStampOf = (data: Git.DiffData) => {
+    const { session, view } = lifecycle.owner()
+    return `${session}|${view}|${generation}|${data.baseRef}`
+  }
 
   async function fetchBodies(
     engine: Host,
@@ -261,13 +294,16 @@ export function register(on: On) {
     data: Git.DiffData,
   ): Promise<boolean> {
     const stamp = bodyStampOf(data)
+    const owner = lifecycle.owner()
+    lifecycle.beginBodies(owner, stamp)
 
-    function loadOf(file: Git.FileStat): Promise<Git.FileHunks | null> {
-      const load = pinned.fetchFileHunks(data, file)
+    function loadOf(file: Git.FileStat): Promise<Git.FileHunks | null | undefined> {
+      if (!lifecycle.isCurrent(owner)) return Promise.resolve(undefined)
+      const load = lifecycle.runBody(owner, stamp, () => pinned.fetchFileHunks(data, file))
       bodyLoads.set(file.path, load)
 
       return load.then(body => {
-        if (bodyStamp === stamp) {
+        if (body !== undefined && lifecycle.isCurrent(owner) && bodyStamp === stamp) {
           model = {
             ...model,
             bodies: new Map(model.bodies).set(file.path, body),
@@ -281,17 +317,11 @@ export function register(on: On) {
     }
 
     return (
-      await mapLimited(
-        drawnFilesOf(model).filter(file => !bodyLoads.has(file.path)),
-        Limits.BODY_FETCH_CONCURRENCY,
-        loadOf,
-      )
+      await Promise.all(drawnFilesOf(model).filter(file => !bodyLoads.has(file.path)).map(loadOf))
     ).includes(null)
   }
 
   function startPoll(engine: Host, pinned: Backend.Backend) {
-    const readHeadKey = () => pinned.headKeyOf().catch(() => '')
-
     if (polled.toplevel === pinned.repository.toplevel) {
       return
     }
@@ -303,11 +333,16 @@ export function register(on: On) {
     timers.set(
       'poll',
       engine.every(Limits.HEAD_POLL_MS, () => {
-        if (!isPaneOpen) {
+        if (!isPaneOpen || backend !== pinned || lifecycle.busy('head')) {
           return
         }
 
-        void readHeadKey().then(key => {
+        const owner = lifecycle.owner()
+        void lifecycle.run('head', owner, async () => {
+          if (!isPaneOpen || backend !== pinned) return
+          const key = await pinned.headKeyOf().catch(() => '')
+          if (!lifecycle.isCurrent(owner) || !isPaneOpen || backend !== pinned) return
+
           const hasMoved = polled.headKey !== '' && key !== polled.headKey
 
           polled.headKey = key
@@ -315,7 +350,7 @@ export function register(on: On) {
           if (hasMoved) {
             scheduleRefresh(engine)
           }
-        })
+        }).catch(() => undefined)
       }),
     )
   }
@@ -323,99 +358,106 @@ export function register(on: On) {
   async function readOf(
     engine: Host,
     pinned: Backend.Backend | null,
-  ): Promise<PaneState.Fetched> {
-    await sessionStartReady
+    waitForCompletion = false,
+  ): Promise<PaneState.Fetched | null> {
+    const owner = lifecycle.owner()
+    const mode = model.requestedMode
+    if (!(await waitForSessionStart(engine, owner))) {
+      return null
+    }
 
     const fetched = (): Promise<Git.FetchOutcome> =>
       pinned
-        ? pinned.fetchDiff(model.requestedMode)
+        ? pinned.fetchDiff(mode)
         : Promise.resolve({ kind: 'no-repository' })
 
-    const [outcome, messages] = await Promise.all([
-      fetched(),
-      engine.messages().catch((): SessionMessage[] => []),
-    ])
-
-    return { outcome, messages }
+    return lifecycle.run('read', owner, async () => {
+      const [outcome, messages] = await Promise.all([
+        fetched(),
+        engine.messages().catch((): SessionMessage[] => []),
+      ])
+      return { outcome, messages }
+    }, waitForCompletion)
   }
 
   async function refresh(
     engine: Host,
     read: PaneState.Fetched | null = null,
   ): Promise<void> {
-    if (isRefreshing) {
-      isRefreshQueued = true
+    const owner = lifecycle.owner()
+    requestSessionConfirmation(engine)
+    if (lifecycle.busy('refresh')) {
+      queuedRefresh = {
+        owner, engine,
+        read: read ?? (queuedRefresh?.owner === owner ? queuedRefresh.read : null),
+      }
 
       return
     }
 
-    isRefreshing = true
-
     const record = Record.recorderOf(engine)
-    const pinned = backend
-    const { epoch } = pin
 
-    try {
-      model = { ...model, isLoading: model.data === null }
+    await lifecycle.run('refresh', owner, async () => {
+      try {
+        if (!backend && !pin.isEmpty && !(await pinBackend(engine))) return
+        if (!lifecycle.isCurrent(owner)) return
+        const pinned = backend
+        model = { ...model, isLoading: model.data === null }
 
-      const fetched = read ?? (await readOf(engine, pinned))
-      const { outcome } = fetched
+        const fetched = read ?? (await readOf(engine, pinned, true))
 
-      if (outcome.kind === 'unavailable') {
-        record.mark(Record.FEATURES.read, {
-          kind: 'sad',
-          reason: 'git_diff_failed',
-        })
+        if (!fetched) return
+
+        const { outcome } = fetched
+
+        if (outcome.kind === 'unavailable') {
+          record.mark(Record.FEATURES.read, {
+            kind: 'sad',
+            reason: 'git_diff_failed',
+          })
+        }
+
+        if (!lifecycle.isCurrent(owner)) return
+
+        model = PaneState.afterFetch(model, fetched)
+
+        switch (outcome.kind) {
+          case 'no-repository':
+          case 'unavailable':
+            break
+          case 'data':
+            generation += 1
+            if (pinned) startPoll(engine, pinned)
+            break
+        }
+
+        const hasHunksFailed = await loadBodies(engine)
+
+        if (outcome.kind === 'data' && (hasHunksFailed || lifecycle.isCurrent(owner))) {
+          record.mark(
+            Record.FEATURES.read,
+            hasHunksFailed
+              ? { kind: 'sad', reason: 'git_hunks_failed' }
+              : { kind: 'ok' },
+          )
+        }
+      } catch (error) {
+        if (lifecycle.isCurrent(owner)) {
+          record.mark(Record.FEATURES.read, {
+            kind: 'sad', reason: 'git_diff_threw',
+          })
+        }
+        throw error
+      } finally {
+        if (lifecycle.isCurrent(owner)) redraw(engine)
       }
+    })
 
-      if (epoch !== pin.epoch) {
-        return
-      }
-
-      model = PaneState.afterFetch(model, fetched)
-
-      switch (outcome.kind) {
-        case 'no-repository':
-        case 'unavailable':
-          break
-        case 'data':
-          generation += 1
-
-          if (pinned) {
-            startPoll(engine, pinned)
-          }
-
-          break
-      }
-
-      const hasHunksFailed = await loadBodies(engine)
-
-      if (outcome.kind === 'data' && (hasHunksFailed || epoch === pin.epoch)) {
-        record.mark(
-          Record.FEATURES.read,
-          hasHunksFailed
-            ? { kind: 'sad', reason: 'git_hunks_failed' }
-            : { kind: 'ok' },
-        )
-      }
-    } catch (error) {
-      record.mark(Record.FEATURES.read, {
-        kind: 'sad',
-        reason: 'git_diff_threw',
-      })
-
-      throw error
-    } finally {
-      isRefreshing = false
-
-      if (epoch === pin.epoch) {
-        redraw(engine)
-      }
-
-      if (isRefreshQueued) {
-        isRefreshQueued = false
-        scheduleRefresh(engine)
-      }
+    if (lifecycle.isCurrent(owner) && queuedRefresh?.owner === owner) {
+      const queued = queuedRefresh
+      queuedRefresh = null
+      if (queued.read) void refresh(queued.engine, queued.read).catch(() => undefined)
+      else scheduleRefresh(queued.engine)
     }
   }
 
@@ -438,6 +480,9 @@ export function register(on: On) {
   ): Promise<boolean> {
     const { epoch } = pin
     opens += 1
+    if (openingPane !== null) {
+      engine.uiLog('The diff panel is waiting for an earlier pane operation to finish.')
+    }
 
     const opening = (openingPane ?? Promise.resolve(false))
       .catch(() => false)
@@ -464,6 +509,7 @@ export function register(on: On) {
     read: PaneState.Fetched | null,
   ): Promise<boolean> {
     const { epoch } = pin
+    const owner = lifecycle.owner()
     const isDialog = model.isFullscreen === false
 
     model = {
@@ -483,7 +529,7 @@ export function register(on: On) {
       await refresh(engine).catch(() => undefined)
     }
 
-    if (epoch !== pin.epoch) {
+    if (!(await lifecycle.waitForPaneCloses(owner)) || epoch !== pin.epoch) {
       return false
     }
 
@@ -507,6 +553,8 @@ export function register(on: On) {
 
         if (!isWaiting && paneCloses === closedBefore) {
           isPaneOpen = true
+          paneTrigger = trigger
+          void recordShown(engine)
           await pinBackend(engine).catch(() => false)
 
           if (isPaneOpen) {
@@ -525,17 +573,8 @@ export function register(on: On) {
     }
 
     isPaneOpen = true
-
-    const sessionId = await engine.sessionId().catch(() => null)
-
-    if (epoch !== pin.epoch) {
-      return isPaneOpen
-    }
-
-    if (sessionId !== null && sessionId !== shownSessionId) {
-      shownSessionId = sessionId
-      Record.recorderOf(engine).shown(trigger, Record.widthBucketOf(columns))
-    }
+    paneTrigger = trigger
+    void recordShown(engine)
 
     const isStale = isDialog || read !== null || landed !== landedBefore
 
@@ -546,9 +585,34 @@ export function register(on: On) {
     return true
   }
 
-  async function closePane(engine: Host): Promise<void> {
-    await engine.closePane({ id: Names.PANE_ID })
-    isPaneOpen = false
+  async function recordShown(engine: Host): Promise<void> {
+    const { epoch } = pin
+    const closedBefore = paneCloses
+    const trigger = paneTrigger
+
+    if (!isPaneOpen || trigger === null) {
+      return
+    }
+
+    const sessionId = await engine.sessionId().catch(() => null)
+
+    if (epoch !== pin.epoch || paneCloses !== closedBefore || !isPaneOpen) {
+      return
+    }
+
+    if (sessionId !== null && sessionId !== shownSessionId) {
+      shownSessionId = sessionId
+      Record.recorderOf(engine).shown(trigger, Record.widthBucketOf(columns))
+    }
+  }
+
+  async function closePane(engine: Host, isCleanup = false): Promise<boolean> {
+    const owner = lifecycle.owner()
+    return (await lifecycle.run(isCleanup ? 'pane-cleanup' : 'pane-close', owner, async () => {
+      await engine.closePane({ id: Names.PANE_ID })
+      isPaneOpen = false
+      return true
+    }, true)) ?? false
   }
 
   function markTabSwitch(engine: Host, tab: (typeof Record.TABS)[number]) {
@@ -567,37 +631,43 @@ export function register(on: On) {
     engine: Host,
     floor: number,
   ): Promise<void> {
-    if (isAutoOpening) {
+    if (lifecycle.busy('auto')) {
       return
     }
 
-    isAutoOpening = true
-    const { epoch } = pin
+    const owner = lifecycle.owner()
 
-    try {
-      while (epoch === pin.epoch && !isTaken()) {
+    await lifecycle.run('auto', owner, async () => {
+      while (lifecycle.isCurrent(owner) && !isTaken()) {
         const seen = landed
         const opened = opens
         const read = await readOf(engine, backend)
+
+        if (!read) {
+          return
+        }
+
         const isOvertaken = opened !== opens
 
         const isCurrent =
-          epoch === pin.epoch && !isOvertaken && hasRoomFor(floor) && !isTaken()
+          lifecycle.isCurrent(owner) && !isOvertaken && hasRoomFor(floor) && !isTaken()
 
         const isListing = isCurrent && PaneState.hasSessionFiles(read.outcome)
 
         if (isListing) {
           hasAutoOpened = true
 
-          const isPlaced = await openPane(engine, 'auto_open', read)
+          let isPlaced = false
 
-          if (epoch !== pin.epoch) {
-            return
+          try {
+            isPlaced = await openPane(engine, 'auto_open', read)
+          } finally {
+            if (lifecycle.isCurrent(owner) && !isPlaced) {
+              hasAutoOpened = isPaneOpen
+            }
           }
 
-          if (!isPlaced) {
-            hasAutoOpened = false
-
+          if (!lifecycle.isCurrent(owner) || !isPlaced) {
             return
           }
         }
@@ -612,11 +682,7 @@ export function register(on: On) {
           scheduleRefresh(engine)
         }
       }
-    } finally {
-      if (epoch === pin.epoch) {
-        isAutoOpening = false
-      }
-    }
+    })
   }
 
   async function openOnFirstEdit(
@@ -726,6 +792,8 @@ export function register(on: On) {
         return
       }
 
+      lifecycle.advance(false)
+      queuedRefresh = null
       model = { ...model, requestedMode: mode }
 
       Record.recorderOf(engine).mark(Record.FEATURES.baseSwitch, {
@@ -789,16 +857,28 @@ export function register(on: On) {
   async function startedAtOf(engine: Host): Promise<number | null> {
     const startedAt: unknown = await engine.startedAt().catch(() => undefined)
 
-    return typeof startedAt === 'number' ? startedAt : null
+    return typeof startedAt === 'number' && Number.isFinite(startedAt) ? startedAt : null
   }
 
-  async function resetSessionStart(engine: Host, isResume: boolean): Promise<void> {
+  async function waitForSessionStart(
+    engine: Host,
+    owner: ReturnType<Lifecycle['owner']>,
+  ): Promise<boolean> {
+    if (sessionChange?.phase === 'initializing' && lifecycle.isSession(owner)) {
+      engine.uiLog('The diff panel is waiting for the active session timing and any unfinished pane operation.')
+    }
+    const ready = await lifecycle.untilChanged(owner, sessionStartReady)
+    return ready === true && lifecycle.isCurrent(owner)
+  }
+
+  async function resetSessionStart(engine: Host): Promise<void> {
     const { epoch } = pin
-    const startedAt =
-      (await startedAtOf(engine)) ??
-      (isResume ? sessionStartMs : await engine.now())
+    const startedAt = await startedAtOf(engine)
 
     if (epoch === pin.epoch) {
+      if (startedAt === null) {
+        throw new Error(Names.SESSION_TIMING_UNAVAILABLE_TEXT)
+      }
       sessionStartMs = startedAt
     }
   }
@@ -924,13 +1004,21 @@ export function register(on: On) {
       return next(e)
     }
 
-    const isAnswered = (await pinBackend(host)) || (await pinBackend(host))
+    const commandOwner = lifecycle.owner()
+    if (!isPaneOpen) {
+      let isAnswered = await pinBackend(host)
+      if (!lifecycle.isSession(commandOwner)) return { text: Names.SESSION_CHANGED_TEXT }
+      if (!isAnswered) isAnswered = await pinBackend(host)
+      if (!lifecycle.isSession(commandOwner)) return { text: Names.SESSION_CHANGED_TEXT }
 
-    if (!backend) {
-      return {
-        text: isAnswered
-          ? Names.NOT_IN_REPOSITORY_TEXT
-          : Names.GIT_UNANSWERED_TEXT,
+      if (!backend) {
+        return {
+          text: sessionChange?.phase === 'unavailable'
+            ? Names.SESSION_TIMING_UNAVAILABLE_TEXT
+            : isAnswered
+            ? Names.NOT_IN_REPOSITORY_TEXT
+            : Names.GIT_UNANSWERED_TEXT,
+        }
       }
     }
 
@@ -953,7 +1041,7 @@ export function register(on: On) {
 
     const isDone = isOpening
       ? await openPane(host, 'manual')
-      : await closePane(host).then(() => true)
+      : await closePane(host)
 
     if (!isDone) {
       return {
@@ -1001,6 +1089,7 @@ export function register(on: On) {
     if (isClosed) {
       paneCloses += 1
       isPaneOpen = false
+      paneTrigger = null
     }
 
     const isDialog = model.isFullscreen === false
@@ -1059,64 +1148,108 @@ export function register(on: On) {
     return {}
   })
 
-  on('command.run', { command: ['clear', 'resume'] }, async ($, e, next) => {
-    const result = await next(e)
-
-    if (!host) {
-      return result
-    }
-
-    const isResume = e.command === 'resume'
-    const epochBeforeClose = pin.epoch
-
-    if (isPaneOpen && isResume) {
-      try {
-        await closePane(host)
-      } catch (error) {
-        host.uiLog(
-          `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(error))}`,
-        )
-      }
-    }
-
-    if (epochBeforeClose !== pin.epoch) {
-      return result
-    }
-
-    const isKeptOpen = isPaneOpen
-
+  function beginSessionChange(engine: Host, endedId: string, reason: 'clear' | 'resume') {
+    const previous = sessionChange
     unpin()
     timers.get('refresh')?.cancel()
     timers.delete('refresh')
-    isRefreshQueued = false
-    isAutoOpening = false
+    queuedRefresh = null
     hasAutoOpened = false
     hasRestoredEdits = false
     bodyStamp = null
     bodyBase = null
     bodyLoads.clear()
-    disarm(host)
+    disarm(engine)
     model = PaneState.afterNewSession(model)
+    let release = (_ready: boolean) => {}
+    sessionStartReady = new Promise<boolean>(resolve => { release = resolve })
+    sessionChange = {
+      owner: lifecycle.owner(), endedId, reason, phase: 'pending',
+      requested: 0, attempted: 0, release,
+    }
+    previous?.release(false)
+  }
 
-    const { epoch } = pin
-    const starting = resetSessionStart(host, isResume)
-    sessionStartReady = starting.catch(() => undefined)
-    await starting
+  function requestSessionConfirmation(engine: Host) {
+    const change = sessionChange
+    if (!change || (change.phase !== 'pending' && change.phase !== 'unavailable')) return
+    change.requested += 1
+    confirmSessionChange(engine, change)
+  }
 
-    if (epoch !== pin.epoch) {
-      return result
+  function confirmSessionChange(engine: Host, change: SessionChange) {
+    if (change !== sessionChange || change.phase === 'ready' || change.phase === 'initializing' || lifecycle.busy('session')) return
+
+    if (change.phase === 'unavailable') {
+      sessionStartReady = new Promise<boolean>(resolve => { change.release = resolve })
+      change.phase = 'pending'
     }
 
-    if (isKeptOpen) {
-      await pinBackend(host)
-      void refresh(host)
-    }
+    void lifecycle.run('session', change.owner, async () => {
+      while (change === sessionChange && change.phase === 'pending') {
+        change.attempted = change.requested
+        const id = await engine.sessionId().catch(() => null)
+        if (!lifecycle.isSession(change.owner) || change !== sessionChange) return
 
-    if (isResume) {
-      void openOnRestore(host).catch(() => undefined)
-    }
+        if (id === null || id === change.endedId) {
+          if (change.attempted !== change.requested) continue
+          engine.uiLog('The diff panel is waiting for the active session to be confirmed.')
+          return
+        }
 
-    return result
+        change.phase = 'initializing'
+        const starting = resetSessionStart(engine)
+        void starting.catch(() => undefined)
+
+        if (isPaneOpen && change.reason === 'resume') {
+          try {
+            await closePane(engine, true)
+          } catch (error) {
+            engine.uiLog(
+              `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(error))}`,
+            )
+          }
+        }
+
+        await starting
+        if (!lifecycle.isSession(change.owner) || change !== sessionChange) return
+        change.phase = 'ready'
+        change.release(true)
+
+        if (isPaneOpen) {
+          void recordShown(engine)
+          await pinBackend(engine)
+          if (lifecycle.isSession(change.owner) && isPaneOpen) void refresh(engine)
+        }
+        if (lifecycle.isSession(change.owner) && change.reason === 'resume') {
+          void openOnRestore(engine).catch(() => undefined)
+        }
+      }
+    }).catch(error => {
+      if (change !== sessionChange) return
+      change.phase = 'unavailable'
+      change.release(false)
+      engine.uiLog(`Could not initialize the diff session: ${Views.sanitizeName(messageOf(error))}`)
+    }).finally(() => {
+      if ((change.phase === 'pending' || change.phase === 'unavailable') && change.attempted !== change.requested) {
+        confirmSessionChange(engine, change)
+      }
+    })
+  }
+
+  on('session.end', ($, e, next) => {
+    if (host && (e.reason === 'clear' || e.reason === 'resume')) {
+      beginSessionChange(host, e.sessionId, e.reason)
+    }
+    return next(e)
+  })
+
+  on('command.run', { command: ['clear', 'resume'] }, async ($, e, next) => {
+    try {
+      return await next(e)
+    } finally {
+      if (host) requestSessionConfirmation(host)
+    }
   })
 
   function afterTool(
@@ -1151,7 +1284,12 @@ export function register(on: On) {
 
   on(
     'tool.call',
-    { tool: [...Tools.EDITING_TOOLS, ...Tools.SHELL_TOOLS] },
+    {
+      tool: [
+        ...Tools.EDITING_TOOLS,
+        ...Tools.SHELL_TOOLS.map(name => new RegExp('^' + name + '$')),
+      ],
+    },
     async ($, e, next) => {
       let result: ResultOf['tool.call'] | undefined
 

@@ -46,7 +46,8 @@ describe('register', () => {
 
     on('tool.call', () => ({ result: 'done' }))
     on('turn.complete', ($, e) => ({ text: e.answer }))
-    on('command.run', { command: 'clear' }, () => ({}))
+    const switchSession = Fixtures.switchSessions(on, $, world.clock)
+    on('command.run', { command: 'clear' }, () => switchSession('clear'))
 
     await $.session.start(Fixtures.SESSION)
     await $.ui.render(Fixtures.hintAt(Limits.AUTO_OPEN_MIN_COLUMNS - 1))
@@ -744,7 +745,8 @@ describe('register', () => {
       })
 
     on('tool.call', () => ({ result: 'edited' }))
-    on('command.run', { command: 'clear' }, () => ({}))
+    const switchSession = Fixtures.switchSessions(on, $, world.clock)
+    on('command.run', { command: 'clear' }, () => switchSession('clear'))
 
     await $.session.start(Fixtures.SESSION)
     await $.ui.render(Fixtures.HINT)
@@ -1173,7 +1175,8 @@ describe('register', () => {
   test('/clear leaves the pane it finds open up and reads the repository afresh', async ($, on) => {
     const world = Fixtures.inRepository(on)
 
-    on('command.run', { command: 'clear' }, () => ({}))
+    const switchSession = Fixtures.switchSessions(on, $, world.clock)
+    on('command.run', { command: 'clear' }, () => switchSession('clear'))
 
     await $.session.start(Fixtures.SESSION)
     await $.command.run(Fixtures.DIFF)
@@ -1324,7 +1327,9 @@ describe('register', () => {
       messages: () => transcript,
     })
 
-    on('command.run', { command: 'resume' }, () => {
+    const switchSession = Fixtures.switchSessions(on, $, world.clock)
+    on('command.run', { command: 'resume' }, async () => {
+      await switchSession('resume')
       transcript = Fixtures.EDITED_TRANSCRIPT
 
       return {}
@@ -1438,7 +1443,8 @@ describe('register', () => {
     const probesOf = () =>
       world.runs.filter(run => run.argv.includes('--show-toplevel')).length
 
-    on('command.run', { command: 'clear' }, () => ({}))
+    const switchSession = Fixtures.switchSessions(on, $, world.clock)
+    on('command.run', { command: 'clear' }, () => switchSession('clear'))
 
     await $.session.start(Fixtures.WORKTREE_SESSION)
 

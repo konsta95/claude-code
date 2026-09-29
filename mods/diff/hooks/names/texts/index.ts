@@ -6,6 +6,7 @@ export * from './panel-toggle'
 export * from './register-failed-text-of.js'
 export * from './resize-terminal-text.js'
 export * from './session-changed-text.js'
+export * from './session-timing-unavailable-text.js'
 export * from './untracked-withheld-text-of.js'
 
 export * as default from '.'
