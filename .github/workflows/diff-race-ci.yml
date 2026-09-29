@@ -5,6 +5,7 @@ on:
     branches:
       - "fix/diff-pending-pane-races-01a0e7e9"
       - "fix/diff-resume-denied-close-01a0e7e9"
+      - "fix/diff-recovery-races-01a0e7e9"
   pull_request:
     paths:
       - "mods/**"
@@ -31,6 +32,9 @@ jobs:
 
       - name: Typecheck every mod's hooks and tests
         run: tsc -p mods/tsconfig.json
+
+      - name: Validate the diff plugin
+        run: claude plugin validate mods/diff
 
       - name: Run the complete diff regression suite
         shell: bash
