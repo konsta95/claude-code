@@ -15,6 +15,10 @@ const MOVED = {
   '-- other.ts': '@@ -1 +1 @@\n-const b = 1\n+const b = 2\n',
 }
 
+const UNKNOWN_STATE_REPLY = {
+  text: "The diff panel couldn't tell whether it is shown; run /diff again to check",
+}
+
 const RECORDING: Plugin = {
   name: 'recording',
   tier: 'builtin',
@@ -70,6 +74,7 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
     delaySettings: 0,
     delayBody: 0,
     delayOpen: 0,
+    delayPanes: 0,
     delayClose: 0,
     delaySessionId: 0,
     delayUsage: 0,
@@ -92,6 +97,11 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
     failRead: false,
     failBody: false,
     failOpen: false,
+    failOpenAfter: false,
+    failOpenWaiting: false,
+    failPanes: false,
+    refuseOpenAfter: false,
+    refusePanes: false,
     denyOpen: false,
     denyClose: false,
     sessionId: 'test-session',
@@ -100,10 +110,10 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
   const clock = Fixtures.startsSession(on)
   const opened: { id: string }[] = []
   const closed: { id: string }[] = []
-  const pane = { visible: false }
+  const pane = { visible: false, waiting: false }
   const reads: string[] = []
   const bodyPaths: string[] = []
-  const counts = { messages: 0, preferences: 0, settings: 0, bodies: 0, probes: 0, identities: 0, heads: 0, usages: 0 }
+  const counts = { messages: 0, preferences: 0, settings: 0, bodies: 0, probes: 0, identities: 0, heads: 0, usages: 0, panes: 0 }
   const marks: string[] = []
   const logs: string[] = []
   const preferences: unknown[] = []
@@ -219,12 +229,35 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
     opened.push({ id: e.id })
     const fails = state.failOpen
     const denied = state.denyOpen
+    const failAfter = state.failOpenAfter
+    const failWaiting = state.failOpenWaiting
+    const refuseAfter = state.refuseOpenAfter
     state.denyOpen = false
     if (state.delayOpen > 0) await clock.sleep(state.delayOpen)
     if (denied) return { deny: 'test open denied' }
     if (fails) throw new Error('test placement failed')
+    if (failWaiting) {
+      pane.waiting = true
+      throw new Error('test open response failed while waiting')
+    }
     pane.visible = true
+    if (failAfter) throw new Error('test open response failed after placement')
+    if (refuseAfter) return { deny: 'test open refused after placement' }
     return { value: undefined }
+  })
+  on('ui.panes', async () => {
+    counts.panes += 1
+    const fails = state.failPanes
+    const refuses = state.refusePanes
+    const listed = pane.visible ? [{
+      id: 'diff', title: 'Diff', isShown: true, isFocused: false, isPlaced: true,
+    }] : pane.waiting ? [{
+      id: 'diff', title: 'Diff', isShown: false, isFocused: false, isPlaced: false,
+    }] : []
+    if (state.delayPanes > 0) await clock.sleep(state.delayPanes)
+    if (fails) throw new Error('test pane state unavailable')
+    if (refuses) return { deny: 'test pane lookup refused' }
+    return { value: listed }
   })
   on('ui.close', async (_engine, e) => {
     closed.push({ id: e.id })
@@ -236,6 +269,7 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
     if (state.delayClose > 0) await clock.sleep(state.delayClose)
     if (denied) return { deny: 'test close denied' }
     pane.visible = false
+    pane.waiting = false
     return { value: undefined }
   })
   on('ui.status', () => ({ value: undefined }))
@@ -290,6 +324,478 @@ function heldCall() {
 }
 
 describe('owner-lifecycle', () => {
+  test('review: unknown waiting cleanup stays ordered before a new session successor', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpenWaiting = true
+    world.state.failPanes = true
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    expect({ waiting: world.pane.waiting, opens: world.opened.length, lookups: world.counts.panes })
+      .toEqual({ waiting: true, opens: 1, lookups: 1 })
+    world.state.failOpenWaiting = false
+    world.state.failPanes = false
+    const closing = heldCall()
+    world.state.heldClose = closing.waiting
+    const oldCommand = $.command.run(Fixtures.DIFF).catch(
+      (error: unknown) => ({ error: String(error) }),
+    )
+    await world.clock.settle()
+    const closeCalls = world.closed.length
+    await $.command.run(Fixtures.CLEAR)
+    let successorReply: unknown = 'pending'
+    const successor = $.command.run(Fixtures.DIFF).then(reply => { successorReply = reply }).catch(
+      (error: unknown) => { successorReply = { error: String(error) } },
+    )
+    await world.clock.settle()
+    const beforeRelease = { opens: world.opened.length, reply: successorReply }
+    closing.release()
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const oldReply = await oldCommand
+    await successor
+
+    expect({ closeCalls, beforeRelease, oldReply, successorReply, visible: world.pane.visible }).toEqual({
+      closeCalls: 1,
+      beforeRelease: { opens: 1, reply: 'pending' },
+      oldReply: { text: Names.SESSION_CHANGED_TEXT },
+      successorReply: { text: Names.PANEL_SHOWN_TEXT },
+      visible: true,
+    })
+  })
+
+  test('review: an older absent lookup cannot settle a later uncertain placed open', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpen = true
+    world.state.failPanes = true
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    world.state.failOpen = false
+    world.state.failPanes = false
+    world.state.delayPanes = 2000
+    const oldCommand = $.command.run(Fixtures.DIFF).catch(
+      (error: unknown) => ({ error: String(error) }),
+    )
+    await world.clock.settle()
+    const oldLookupCount = world.counts.panes
+    world.state.delayPanes = 0
+    world.state.failOpenAfter = true
+    world.state.delayOpen = 1000
+    const newer = $.command.run(Fixtures.DIFF).catch(
+      (error: unknown) => ({ error: String(error) }),
+    )
+    await world.clock.settle()
+    const whileOpening = { opens: world.opened.length, lookups: world.counts.panes }
+    world.state.failPanes = true
+    await world.clock.advance(1000)
+    const newerReply = await newer
+    const afterNewer = { visible: world.pane.visible, opens: world.opened.length, lookups: world.counts.panes }
+    world.state.failOpenAfter = false
+    world.state.failPanes = false
+    world.state.delayOpen = 0
+    await world.clock.advance(1000 + Fixtures.SETTLE_MS)
+    await oldCommand
+
+    expect(oldLookupCount).toBe(2)
+    expect(whileOpening).toEqual({ opens: 2, lookups: 3 })
+    expect(newerReply).toEqual(UNKNOWN_STATE_REPLY)
+    expect(afterNewer).toEqual({ visible: true, opens: 2, lookups: 4 })
+    expect(world.closed).toHaveLength(0)
+    expect(world.opened, 'the older absent result cannot authorize another open over the newer placed pane')
+      .toHaveLength(2)
+    expect(world.pane.visible).toBe(true)
+  })
+
+  for (const stateUnavailable of [false, true]) {
+    test(`an after-placement open failure avoids duplicate retries when pane state is ${stateUnavailable ? 'unavailable' : 'placed'}`, async ($, on) => {
+      const world = lifecycleWorld(on, $)
+      await $.session.start(Fixtures.SESSION)
+      await $.ui.render(Fixtures.HINT)
+      world.state.failOpenAfter = true
+      world.state.failPanes = stateUnavailable
+      const edit = {
+        tool: 'Edit' as const, file_path: '/work/app.ts', old_string: '1', new_string: '2',
+      }
+      await $.tool.call(edit)
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      const afterFailure = { visible: world.pane.visible, opens: world.opened.length }
+      world.state.failOpenAfter = false
+      await $.tool.call(edit)
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      const afterEdit = { visible: world.pane.visible, opens: world.opened.length }
+      const uncertainReply = stateUnavailable ? await $.command.run(Fixtures.DIFF) : null
+      world.state.failPanes = false
+      const reply = await $.command.run(Fixtures.DIFF)
+      expect(afterFailure).toEqual({ visible: true, opens: 1 })
+      expect(afterEdit).toEqual({ visible: true, opens: 1 })
+      if (stateUnavailable) {
+        expect(uncertainReply).not.toEqual({ text: Names.PANEL_SHOWN_TEXT })
+        expect(uncertainReply).not.toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+      }
+      expect(reply).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+      expect(world.pane.visible).toBe(false)
+    })
+  }
+
+  test('a failed auto-open looks the pane up and permits a later edit to retry', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpen = true
+    const edit = {
+      tool: 'Edit' as const, file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    }
+    await $.tool.call(edit)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const afterFailure = {
+      visible: world.pane.visible, opens: world.opened.length, lookups: world.counts.panes,
+    }
+    world.state.failOpen = false
+    await $.tool.call(edit)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    expect(afterFailure, 'the engine lists no pane').toEqual({ visible: false, opens: 1, lookups: 1 })
+    expect(world.opened).toHaveLength(2)
+    expect(world.pane.visible).toBe(true)
+  })
+
+  test('an open failure that left the pane waiting closes it and permits a later edit to retry', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpenWaiting = true
+    const edit = {
+      tool: 'Edit' as const, file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    }
+    await $.tool.call(edit)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const afterFailure = {
+      waiting: world.pane.waiting, opens: world.opened.length, lookups: world.counts.panes,
+      closed: world.closed.map(pane => pane.id),
+    }
+    world.state.failOpenWaiting = false
+    await $.tool.call(edit)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+
+    expect(afterFailure).toEqual({ waiting: false, opens: 1, lookups: 1, closed: ['diff'] })
+    expect(world.opened).toHaveLength(2)
+    expect(world.pane.visible).toBe(true)
+  })
+
+  for (const fault of ['thrown', 'refused'] as const) {
+    test(`an unconfirmed auto-open answers /diff with the unknown state and logs both ${fault} failures`, async ($, on) => {
+      const world = lifecycleWorld(on, $)
+      await $.session.start(Fixtures.SESSION)
+      await $.ui.render(Fixtures.HINT)
+      world.state.failOpenAfter = fault === 'thrown'
+      world.state.failPanes = fault === 'thrown'
+      world.state.refuseOpenAfter = fault === 'refused'
+      world.state.refusePanes = fault === 'refused'
+      await $.tool.call({
+        tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+      })
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      const lookups = world.counts.panes
+      const reply = await $.command.run(Fixtures.DIFF)
+
+      expect(lookups, 'the rejected open was looked up').toBe(1)
+      expect(world.counts.panes, '/diff looked the pane up again').toBe(2)
+      expect(reply).toEqual(UNKNOWN_STATE_REPLY)
+      const diagnostic = world.logs.find(line => line.includes('Could not tell whether the diff panel opened'))
+      expect(diagnostic, 'a debug line explains the unknown state').toBeDefined()
+      expect(diagnostic).toContain('ui.open')
+      expect(diagnostic).toContain('ui.panes')
+      if (fault === 'refused') {
+        expect(diagnostic).toContain('test open refused after placement')
+        expect(diagnostic).toContain('test pane lookup refused')
+      }
+      expect(world.opened).toHaveLength(1)
+      expect(world.pane.visible, 'the pane stays as the engine left it').toBe(true)
+    })
+  }
+
+  for (const stateUnavailable of [false, true]) {
+    test(`/diff whose open fails after placement answers ${stateUnavailable ? 'the unknown state' : 'shown'} without opening again`, async ($, on) => {
+      const world = lifecycleWorld(on, $)
+      await $.session.start(Fixtures.SESSION)
+      world.state.failOpenAfter = true
+      world.state.failPanes = stateUnavailable
+      const reply = await $.command.run(Fixtures.DIFF).catch(
+        (error: unknown) => ({ error: String(error) }),
+      )
+      world.state.failOpenAfter = false
+      world.state.failPanes = false
+      const hidden = await $.command.run(Fixtures.DIFF)
+
+      expect(reply).toEqual(stateUnavailable ? UNKNOWN_STATE_REPLY : { text: Names.PANEL_SHOWN_TEXT })
+      expect(world.logs.join('\n')).toContain(stateUnavailable
+        ? 'Could not tell whether the diff panel opened'
+        : 'The diff panel opened, but opening it reported')
+      expect(hidden).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+      expect(world.opened).toHaveLength(1)
+      expect(world.pane.visible).toBe(false)
+    })
+  }
+
+  test('a /diff queued behind an unconfirmed auto-open does not open again', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.delayOpen = 1000
+    world.state.failOpenAfter = true
+    world.state.failPanes = true
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.settle()
+    expect(world.opened, 'the auto-open is placing').toHaveLength(1)
+    const queued = $.command.run(Fixtures.DIFF).catch(
+      (error: unknown) => ({ error: String(error) }),
+    )
+    await world.clock.advance(1000 + Fixtures.SETTLE_MS)
+
+    expect(await queued).toEqual(UNKNOWN_STATE_REPLY)
+    expect(world.opened, 'the queued /diff did not open blindly').toHaveLength(1)
+    expect(world.pane.visible).toBe(true)
+  })
+
+  for (const found of ['placed', 'waiting', 'absent'] as const) {
+    test(`/diff settles an unconfirmed pane the engine then lists as ${found}`, async ($, on) => {
+      const world = lifecycleWorld(on, $)
+      await $.session.start(Fixtures.SESSION)
+      await $.ui.render(Fixtures.HINT)
+      world.state.failOpenAfter = found === 'placed'
+      world.state.failOpenWaiting = found === 'waiting'
+      world.state.failOpen = found === 'absent'
+      world.state.failPanes = true
+      const edit = {
+        tool: 'Edit' as const, file_path: '/work/app.ts', old_string: '1', new_string: '2',
+      }
+      await $.tool.call(edit)
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      world.state.failOpenAfter = false
+      world.state.failOpenWaiting = false
+      world.state.failOpen = false
+      await $.tool.call(edit)
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      const whileUnknown = { opens: world.opened.length, lookups: world.counts.panes }
+      world.state.failPanes = false
+      const reply = await $.command.run(Fixtures.DIFF)
+
+      expect(whileUnknown, 'no edit reopens an unconfirmed pane').toEqual({ opens: 1, lookups: 1 })
+      expect(world.counts.panes).toBe(2)
+      expect(reply).toEqual({
+        text: found === 'placed' ? Names.PANEL_HIDDEN_TEXT : Names.PANEL_SHOWN_TEXT,
+      })
+      expect(world.opened).toHaveLength(found === 'placed' ? 1 : 2)
+      expect(world.closed.map(pane => pane.id), 'no waiting pane is left undrawn').toEqual(
+        found === 'absent' ? [] : ['diff'],
+      )
+      expect(world.pane.visible).toBe(found !== 'placed')
+    })
+  }
+
+  test('an unconfirmed pane stays unconfirmed across /clear, so a new edit does not reopen it', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpenAfter = true
+    world.state.failPanes = true
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    world.state.failOpenAfter = false
+    Object.assign(world.script, MOVED)
+    await $.command.run(Fixtures.CLEAR)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/other.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const afterEdit = { visible: world.pane.visible, opens: world.opened.length }
+    world.state.failPanes = false
+    const reply = await $.command.run(Fixtures.DIFF)
+
+    expect(afterEdit).toEqual({ visible: true, opens: 1 })
+    expect(reply).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+    expect(world.pane.visible).toBe(false)
+  })
+
+  test('/resume removes a pane whose placement was never confirmed', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpenAfter = true
+    world.state.failPanes = true
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    world.state.failOpenAfter = false
+    world.state.failPanes = false
+    await $.command.run(Fixtures.RESUME)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const afterResume = { visible: world.pane.visible, closed: world.closed.map(pane => pane.id) }
+    const reply = await $.command.run(Fixtures.DIFF)
+
+    expect(afterResume, 'the ended session cannot leave a pane behind').toEqual({
+      visible: false, closed: ['diff'],
+    })
+    expect(reply).toEqual({ text: Names.PANEL_SHOWN_TEXT })
+    expect(world.pane.visible).toBe(true)
+  })
+
+  test('a lookup answered after /resume removed the pane cannot mark it open', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpenAfter = true
+    world.state.failPanes = true
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    world.state.failOpenAfter = false
+    world.state.failPanes = false
+    world.state.delayPanes = 1000
+    const stale = $.command.run(Fixtures.DIFF).catch(
+      (error: unknown) => ({ error: String(error) }),
+    )
+    await world.clock.settle()
+    const lookups = world.counts.panes
+    await $.command.run(Fixtures.RESUME)
+    await world.clock.advance(1000 + Fixtures.SETTLE_MS)
+    const staleReply = await stale
+    const afterResume = { visible: world.pane.visible, closed: world.closed.map(pane => pane.id) }
+    world.state.delayPanes = 0
+    const reply = await $.command.run(Fixtures.DIFF)
+
+    expect(lookups, '/diff is looking the pane up').toBe(2)
+    expect(staleReply).toEqual({ text: Names.SESSION_CHANGED_TEXT })
+    expect(afterResume).toEqual({ visible: false, closed: ['diff'] })
+    expect(reply, 'the stale answer left the removed pane closed').toEqual({ text: Names.PANEL_SHOWN_TEXT })
+    expect(world.pane.visible).toBe(true)
+  })
+
+  test('a lookup begun before the pane was hidden cannot settle a later unconfirmed open', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    world.state.failOpenAfter = true
+    world.state.failPanes = true
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    world.state.failOpenAfter = false
+    world.state.failPanes = false
+    world.state.delayPanes = 1000
+    const stale = $.command.run(Fixtures.DIFF).catch(
+      (error: unknown) => ({ error: String(error) }),
+    )
+    await world.clock.settle()
+    const lookups = world.counts.panes
+    world.state.delayPanes = 0
+    const hidden = await $.command.run(Fixtures.DIFF)
+    world.state.failOpen = true
+    world.state.failPanes = true
+    const reopened = await $.command.run(Fixtures.DIFF).catch(
+      (error: unknown) => ({ error: String(error) }),
+    )
+    await world.clock.advance(1000 + Fixtures.SETTLE_MS)
+    const staleReply = await stale
+
+    expect(lookups, '/diff is looking the pane up').toBe(2)
+    expect(hidden).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+    expect(reopened).toEqual(UNKNOWN_STATE_REPLY)
+    expect(staleReply, 'the placed answer predates the hide').toEqual(UNKNOWN_STATE_REPLY)
+    expect(world.opened).toHaveLength(2)
+    expect(world.closed.map(pane => pane.id), 'no close follows the unconfirmed open').toEqual(['diff'])
+    expect(world.pane.visible).toBe(false)
+  })
+
+  test('a refused removal of an ended placement leaves the new session unconfirmed', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.ui.render(Fixtures.HINT)
+    await world.clock.settle()
+    world.state.failOpenAfter = true
+    world.state.delayOpen = 1000
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.settle()
+    Object.assign(world.script, MOVED)
+    await $.command.run(Fixtures.CLEAR)
+    world.state.delayOpen = 0
+    world.state.failOpenAfter = false
+    world.state.denyClose = true
+    await world.clock.advance(3000)
+    await $.tool.call({
+      tool: 'Edit', file_path: '/work/other.ts', old_string: '1', new_string: '2',
+    })
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const afterEdit = { visible: world.pane.visible, opens: world.opened.length }
+    const reply = await $.command.run(Fixtures.DIFF)
+
+    expect(world.logs.join('\n')).toContain('test close denied')
+    expect(afterEdit, 'the new session does not open over an unconfirmed pane').toEqual({
+      visible: true, opens: 1,
+    })
+    expect(reply).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
+    expect(world.pane.visible).toBe(false)
+  })
+
+  for (const command of ['clear', 'resume'] as const) {
+    for (const stage of ['open', 'lookup'] as const) {
+      test(`/${command} during an after-placement open failure's ${stage} removes the ended session pane`, async ($, on) => {
+        const world = lifecycleWorld(on, $)
+        await $.session.start(Fixtures.SESSION)
+        await $.ui.render(Fixtures.HINT)
+        await world.clock.settle()
+        world.state.failOpenAfter = true
+        if (stage === 'open') world.state.delayOpen = 1000
+        else world.state.delayPanes = 1000
+        await $.tool.call({
+          tool: 'Edit', file_path: '/work/app.ts', old_string: '1', new_string: '2',
+        })
+        await world.clock.settle()
+        const beforeSwitch = { opens: world.opened.length, lookups: world.counts.panes }
+
+        Object.assign(world.script, MOVED)
+        await $.command.run(command === 'clear' ? Fixtures.CLEAR : Fixtures.RESUME)
+        world.state.delayOpen = 0
+        world.state.failOpenAfter = false
+        await world.clock.advance(3000)
+        const afterSwitch = {
+          visible: world.pane.visible, closed: world.closed.map(pane => pane.id),
+          lookups: world.counts.panes,
+        }
+        await $.tool.call({
+          tool: 'Edit', file_path: '/work/other.ts', old_string: '1', new_string: '2',
+        })
+        await world.clock.advance(Fixtures.SETTLE_MS)
+
+        expect(beforeSwitch).toEqual({ opens: 1, lookups: stage === 'open' ? 0 : 1 })
+        expect(afterSwitch, 'the ended session cannot leave a pane behind').toEqual({
+          visible: false, closed: ['diff'], lookups: stage === 'open' ? 0 : 1,
+        })
+        expect(world.opened, 'the new session opens its own pane').toHaveLength(2)
+        expect(world.pane.visible).toBe(true)
+        const text = Fixtures.textOf(await $.ui.render(Fixtures.PANE))
+        expect(text).toContain('other.ts')
+        expect(text).not.toContain('app.ts')
+      })
+    }
+  }
+
   test('body capacity retains old filter work and recovers only the newest session', async ($, on) => {
     const world = lifecycleWorld(on, $)
     const paths = ['app.ts', ...Array.from({ length: Limits.BODY_FETCH_CONCURRENCY }, (_, at) => `body${at}.test.ts`)]

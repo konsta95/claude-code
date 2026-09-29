@@ -58,8 +58,12 @@ export function register(on: On) {
     attempted: number
     release: (ready: boolean) => void
   }
+  type PaneLookup =
+    | { kind: 'placed' | 'waiting' | 'absent' }
+    | { kind: 'unknown'; reason: string }
   let sessionChange: SessionChange | null = null
   let isPaneOpen = false
+  let isPaneUnknown = false
   let openingPane: Promise<boolean> | null = null
   let paneCloses = 0
   let dialogRows: number | null = null
@@ -487,7 +491,7 @@ export function register(on: On) {
     const opening = (openingPane ?? Promise.resolve(false))
       .catch(() => false)
       .then(() => {
-        if (epoch !== pin.epoch) {
+        if (epoch !== pin.epoch || isPaneUnknown) {
           return false
         }
 
@@ -533,13 +537,22 @@ export function register(on: On) {
       return false
     }
 
-    const opened = await engine.openPane(
-      isDialog
-        ? { ...dialogPane(), focus: true }
-        : { id: Names.PANE_ID, title: Names.PANE_TITLE, holdToasts: true },
-    )
+    const closesAtOpen = paneCloses
+    let isWaiting = false
 
-    const isWaiting = isRecord(opened) && opened.isPlaced === false
+    try {
+      const opened = await engine.openPane(
+        isDialog
+          ? { ...dialogPane(), focus: true }
+          : { id: Names.PANE_ID, title: Names.PANE_TITLE, holdToasts: true },
+      )
+
+      isWaiting = isRecord(opened) && opened.isPlaced === false
+    } catch (error) {
+      if (!(await isPlacedAfterRejection(engine, error, epoch, closesAtOpen, trigger))) {
+        return false
+      }
+    }
 
     if (epoch !== pin.epoch) {
       const closedBefore = paneCloses
@@ -585,6 +598,112 @@ export function register(on: On) {
     return true
   }
 
+  async function paneOf(engine: Host): Promise<PaneLookup> {
+    let panes: unknown
+
+    try {
+      panes = await engine.panes()
+    } catch (error) {
+      return { kind: 'unknown', reason: messageOf(error) }
+    }
+
+    if (!Array.isArray(panes)) {
+      return { kind: 'unknown', reason: 'the engine listed no panes' }
+    }
+
+    const pane = panes
+      .filter(isRecord)
+      .find(listed => listed.id === Names.PANE_ID)
+
+    if (!pane) {
+      return { kind: 'absent' }
+    }
+
+    return typeof pane.isPlaced === 'boolean'
+      ? { kind: pane.isPlaced ? 'placed' : 'waiting' }
+      : { kind: 'unknown', reason: 'the engine did not say whether the diff panel is placed' }
+  }
+
+  async function isPlacedAfterRejection(
+    engine: Host,
+    error: unknown,
+    epoch: number,
+    closesAtOpen: number,
+    trigger: (typeof Record.SHOWN_TRIGGERS)[number],
+  ): Promise<boolean> {
+    const pane = epoch === pin.epoch ? await paneOf(engine) : null
+
+    if (pane === null || epoch !== pin.epoch) {
+      try {
+        await engine.closePane({ id: Names.PANE_ID })
+      } catch (closeError) {
+        engine.uiLog(
+          `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(closeError))}`,
+        )
+
+        if (paneCloses === closesAtOpen) {
+          isPaneUnknown = true
+        }
+      }
+
+      throw error
+    }
+
+    if (paneCloses !== closesAtOpen) {
+      throw error
+    }
+
+    const reason = Views.sanitizeName(messageOf(error))
+
+    switch (pane.kind) {
+      case 'absent':
+        throw error
+      case 'waiting':
+        await engine.closePane({ id: Names.PANE_ID }).catch(() => undefined)
+        throw error
+      case 'unknown':
+        isPaneUnknown = true
+        paneTrigger = trigger
+        engine.uiLog(
+          `Could not tell whether the diff panel opened: ${reason}; the pane lookup failed: ${Views.sanitizeName(pane.reason)}`,
+        )
+        return false
+      case 'placed':
+        engine.uiLog(`The diff panel opened, but opening it reported: ${reason}`)
+        return true
+    }
+  }
+
+  async function settleUnknownPane(engine: Host): Promise<void> {
+    const { epoch } = pin
+    const closedBefore = paneCloses
+    const opened = opens
+    const pane = await paneOf(engine)
+
+    if (!isPaneUnknown || epoch !== pin.epoch || paneCloses !== closedBefore || opens !== opened) {
+      return
+    }
+
+    if (pane.kind === 'unknown') {
+      engine.uiLog(
+        `Could not tell whether the diff panel is shown: ${Views.sanitizeName(pane.reason)}`,
+      )
+
+      return
+    }
+
+    isPaneUnknown = false
+    isPaneOpen = pane.kind === 'placed'
+
+    if (isPaneOpen) {
+      void recordShown(engine)
+    }
+
+    if (pane.kind === 'waiting') {
+      await closePane(engine, true).catch(() => undefined)
+    }
+  }
+
   async function recordShown(engine: Host): Promise<void> {
     const { epoch } = pin
     const closedBefore = paneCloses
@@ -611,6 +730,7 @@ export function register(on: On) {
     return (await lifecycle.run(isCleanup ? 'pane-cleanup' : 'pane-close', owner, async () => {
       await engine.closePane({ id: Names.PANE_ID })
       isPaneOpen = false
+      isPaneUnknown = false
       return true
     }, true)) ?? false
   }
@@ -622,7 +742,7 @@ export function register(on: On) {
     })
   }
 
-  const isTaken = () => isPaneOpen || hasAutoOpened
+  const isTaken = () => isPaneOpen || hasAutoOpened || isPaneUnknown
 
   const hasRoomFor = (floor: number) =>
     model.isFullscreen === true && columns !== null && columns >= floor
@@ -922,6 +1042,7 @@ export function register(on: On) {
         uiLog: text => $.ui.log(text),
         openPane: pane => $.ui.open(pane),
         closePane: pane => $.ui.close(pane),
+        panes: () => $.ui.panes(),
         registerCommand: spec => $.command.register(spec),
         sessionId: () => $.session.id(),
         startedAt: () =>
@@ -1005,6 +1126,11 @@ export function register(on: On) {
     }
 
     const commandOwner = lifecycle.owner()
+    if (isPaneUnknown) {
+      await settleUnknownPane(host)
+      if (!lifecycle.isSession(commandOwner)) return { text: Names.SESSION_CHANGED_TEXT }
+      if (isPaneUnknown) return { text: Names.PANEL_STATE_UNKNOWN_TEXT }
+    }
     if (!isPaneOpen) {
       let isAnswered = await pinBackend(host)
       if (!lifecycle.isSession(commandOwner)) return { text: Names.SESSION_CHANGED_TEXT }
@@ -1047,6 +1173,8 @@ export function register(on: On) {
       return {
         text: epoch !== pin.epoch
           ? Names.SESSION_CHANGED_TEXT
+          : isPaneUnknown
+          ? Names.PANEL_STATE_UNKNOWN_TEXT
           : Names.RESIZE_TERMINAL_TEXT,
       }
     }
@@ -1089,6 +1217,7 @@ export function register(on: On) {
     if (isClosed) {
       paneCloses += 1
       isPaneOpen = false
+      isPaneUnknown = false
       paneTrigger = null
     }
 
@@ -1201,7 +1330,7 @@ export function register(on: On) {
         const starting = resetSessionStart(engine)
         void starting.catch(() => undefined)
 
-        if (isPaneOpen && change.reason === 'resume') {
+        if ((isPaneOpen || isPaneUnknown) && change.reason === 'resume') {
           try {
             await closePane(engine, true)
           } catch (error) {
