@@ -1282,17 +1282,11 @@ describe('register', () => {
     const world = Fixtures.inRepository(on)
     const logged = Fixtures.keeping<Args<'telemetry.log'>>()
 
-    let sessionId = 'first'
-
     on('telemetry.log', logged.hook)
-    on('session.id', () => ({ value: sessionId }))
+    const switchSession = Fixtures.switchSessions(on, $, world.clock)
     on('tool.call', () => ({ result: 'edited' }))
 
-    on('command.run', { command: 'clear' }, () => {
-      sessionId = 'second'
-
-      return {}
-    })
+    on('command.run', { command: 'clear' }, () => switchSession('clear'))
 
     await $.session.start(Fixtures.SESSION)
     await $.ui.render(Fixtures.HINT)

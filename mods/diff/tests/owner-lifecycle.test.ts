@@ -1116,10 +1116,10 @@ describe('owner-lifecycle', () => {
     const afterReopen = world.counts.heads
     second.release()
     await world.clock.advance(Fixtures.SETTLE_MS)
-    expect(beforeHide).toBe(2)
+    expect(beforeHide).toBe(3)
     expect(hidden).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
-    expect(whileHidden).toBe(2)
-    expect(afterReopen).toBe(3)
+    expect(whileHidden).toBe(3)
+    expect(afterReopen).toBe(5)
     expect(world.pane.visible).toBe(true)
   })
 
@@ -1152,9 +1152,9 @@ describe('owner-lifecycle', () => {
     const afterMove = world.reads.length
     second.release()
     await world.clock.advance(Fixtures.SETTLE_MS)
-    expect(saturated.heads).toBe(2)
+    expect(saturated.heads).toBe(3)
     expect(saturated.logs.join('\n')).toContain('waiting for earlier work')
-    expect(recovered).toBe(3)
+    expect(recovered).toBe(4)
     expect(afterMove).toBe(beforeMove + 1)
     expect(world.reads.length).toBe(afterMove)
     expect(world.pane.visible).toBe(true)
@@ -1196,7 +1196,7 @@ describe('owner-lifecycle', () => {
     const beforeRelease = { reads: world.reads.length, heads: world.counts.heads }
     held.release()
     await world.clock.advance(Fixtures.SETTLE_MS + Limits.HEAD_POLL_MS)
-    expect(beforeRelease.heads).toBe(3)
+    expect(beforeRelease.heads).toBe(5)
     expect(world.reads.length).toBe(beforeRelease.reads)
     expect(world.pane.visible).toBe(true)
   })
@@ -1216,7 +1216,7 @@ describe('owner-lifecycle', () => {
     const beforeRelease = world.reads.length
     held.release()
     await world.clock.advance(Fixtures.SETTLE_MS)
-    expect(world.counts.heads).toBe(2)
+    expect(world.counts.heads).toBe(3)
     expect(hidden).toEqual({ text: Names.PANEL_HIDDEN_TEXT })
     expect(world.reads.length).toBe(beforeRelease)
     expect(world.pane.visible).toBe(false)

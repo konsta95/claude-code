@@ -394,16 +394,16 @@ export function register(on: On) {
       return
     }
 
-    void pinned
-      .headKeyOf()
-      .catch(() => '')
-      .then(key => {
-        const isFirst = backend === pinned && polled.headKey === ''
+    const owner = lifecycle.owner()
+    void lifecycle.run('head', owner, async () => {
+      if (!isPaneOpen || backend !== pinned || polled.headKey !== '') return
+      const key = await pinned.headKeyOf().catch(() => '')
+      const isFirst = lifecycle.isCurrent(owner) && backend === pinned && polled.headKey === ''
 
-        if (isFirst) {
-          polled.headKey = key
-        }
-      })
+      if (isFirst) {
+        polled.headKey = key
+      }
+    }).catch(() => undefined)
   }
 
   function startPoll(engine: Host, pinned: Backend.Backend) {
