@@ -34,13 +34,10 @@ import Views from './views'
  * Registers the diff pane: `/diff` once the built-in stands down, the
  * pane's drawing and refresh, its opening on Claude's first edit, the ask.
  *
- * Git runs when the built-in's would: `session.start` binds the host and
- * registers `/diff`, and off its dispatch reads the transcript, so a resumed
- * session whose turns already edited opens as its first edit would; `/diff`
- * or the main loop's first checkpointed edit with room pins the backend,
- * until `/clear`, which reads afresh under a pane it leaves open; a docked
- * pane fetches, then opens, and such an edit inside the tree fetches until
- * one lists a file to open on.
+ * Git runs when the built-in's would: none at the start; `/diff` or the main
+ * loop's first checkpointed edit with room pins the backend, until `/clear`,
+ * which reads afresh under a pane it leaves open; such an edit inside the
+ * tree fetches until one lists a file to open on.
  *
  * @param on the engine's registrar
  */
@@ -207,6 +204,7 @@ export function register(on: On) {
 
     if (!lifecycle.isCurrent(owner)) return false
     backend = probed
+    startPoll(engine, probed)
 
     const mode = stored && probed.baseModes.includes(stored) ? stored : null
 
@@ -389,6 +387,25 @@ export function register(on: On) {
     ).includes(null)
   }
 
+  function keepBaseline() {
+    const pinned = backend
+
+    if (!pinned || polled.headKey !== '') {
+      return
+    }
+
+    void pinned
+      .headKeyOf()
+      .catch(() => '')
+      .then(key => {
+        const isFirst = backend === pinned && polled.headKey === ''
+
+        if (isFirst) {
+          polled.headKey = key
+        }
+      })
+  }
+
   function startPoll(engine: Host, pinned: Backend.Backend) {
     if (polled.toplevel === pinned.repository.toplevel) {
       return
@@ -495,7 +512,6 @@ export function register(on: On) {
             break
           case 'data':
             generation += 1
-            if (pinned) startPoll(engine, pinned)
             break
         }
 
@@ -652,6 +668,7 @@ export function register(on: On) {
     }
 
     isPaneOpen = true
+    keepBaseline()
     paneTrigger = trigger
     void recordShown(engine)
 
@@ -1143,8 +1160,7 @@ export function register(on: On) {
 
   on('ui.render', { component: 'PromptHint' }, ($, e, next) => {
     if (isOnPaneSurface(e)) {
-      const viewport: { columns?: number; isFullscreen?: boolean } | undefined =
-        e.viewport
+      const { viewport } = e
 
       const isFirstMeasure = columns === null && viewport?.columns !== undefined
 
@@ -1419,9 +1435,13 @@ export function register(on: On) {
         change.release(true)
 
         if (isPaneOpen) {
+          if (change.reason === 'clear') paneTrigger = 'manual'
           void recordShown(engine)
           await pinBackend(engine)
-          if (lifecycle.isSession(change.owner) && isPaneOpen) void refresh(engine)
+          if (lifecycle.isSession(change.owner) && isPaneOpen) {
+            keepBaseline()
+            void refresh(engine)
+          }
         }
         if (lifecycle.isSession(change.owner) && change.reason === 'resume') {
           void openOnRestore(engine).catch(() => undefined)
