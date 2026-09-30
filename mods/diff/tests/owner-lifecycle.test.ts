@@ -84,6 +84,7 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
     heldRead: null as Promise<void> | null,
     heldBody: null as Promise<void> | null,
     heldBodies: null as Promise<void> | null,
+    heldOpen: null as Promise<void> | null,
     heldClose: null as Promise<void> | null,
     heldCommandBefore: null as Promise<void> | null,
     heldCommandAfter: null as Promise<void> | null,
@@ -110,6 +111,8 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
   const clock = Fixtures.startsSession(on)
   const opened: { id: string }[] = []
   const closed: { id: string }[] = []
+  const placedRows: number[] = []
+  const openReplyFailures: ('error' | 'refusal')[] = []
   const pane = { visible: false, waiting: false }
   const reads: string[] = []
   const bodyPaths: string[] = []
@@ -232,7 +235,10 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
     const failAfter = state.failOpenAfter
     const failWaiting = state.failOpenWaiting
     const refuseAfter = state.refuseOpenAfter
+    const held = state.heldOpen
+    state.heldOpen = null
     state.denyOpen = false
+    if (held) await held
     if (state.delayOpen > 0) await clock.sleep(state.delayOpen)
     if (denied) return { deny: 'test open denied' }
     if (fails) throw new Error('test placement failed')
@@ -241,8 +247,15 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
       throw new Error('test open response failed while waiting')
     }
     pane.visible = true
-    if (failAfter) throw new Error('test open response failed after placement')
-    if (refuseAfter) return { deny: 'test open refused after placement' }
+    if (typeof e.rows === 'number') placedRows.push(e.rows)
+    if (failAfter) {
+      openReplyFailures.push('error')
+      throw new Error('test open response failed after placement')
+    }
+    if (refuseAfter) {
+      openReplyFailures.push('refusal')
+      return { deny: 'test open refused after placement' }
+    }
     return { value: undefined }
   })
   on('ui.panes', async () => {
@@ -304,7 +317,7 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
   mock.store(on, stored)
   mock.env(on, {})
 
-  return { clock, opened, closed, pane, script, state, reads, bodyPaths, counts, marks, logs, preferences }
+  return { clock, opened, closed, placedRows, openReplyFailures, pane, script, state, reads, bodyPaths, counts, marks, logs, preferences }
 }
 
 function filesWrittenAt(on: On, mtimeMs: number) {
@@ -324,6 +337,190 @@ function heldCall() {
 }
 
 describe('owner-lifecycle', () => {
+  for (const outcome of ['error', 'refusal'] as const) {
+    test(`a detail fit with an after-placement ${outcome} still lets the list return to its size`, async ($, on) => {
+      const world = lifecycleWorld(on, $)
+      world.state.transcript = Fixtures.EDITED_TRANSCRIPT
+      await $.session.start(Fixtures.SESSION)
+      await $.command.run(Fixtures.DIALOG_DIFF)
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      const ui = await $.ui.mount({ ...Fixtures.INLINE_PANE, plugin: 'diff', surface: 'terminal' })
+      const listRows = world.placedRows[world.placedRows.length - 1]
+      if (listRows === undefined) throw new Error('the initial list has no placed row count')
+      world.state.failOpenAfter = outcome === 'error'
+      world.state.refuseOpenAfter = outcome === 'refusal'
+      try {
+        await ui.press({ key: 'file:app.ts' })
+        await world.clock.advance(Fixtures.SETTLE_MS)
+        expect(world.openReplyFailures).toEqual([outcome])
+        expect(world.placedRows[world.placedRows.length - 1]).toBeGreaterThan(listRows)
+        world.state.failOpenAfter = false
+        world.state.refuseOpenAfter = false
+        await ui.select({ key: 'source', value: 'current' })
+        await world.clock.advance(Fixtures.SETTLE_MS)
+      } finally {
+        world.state.failOpenAfter = false
+        world.state.refuseOpenAfter = false
+        await ui.unmount()
+      }
+      expect({ visible: world.pane.visible, rows: world.placedRows[world.placedRows.length - 1] })
+        .toEqual({ visible: true, rows: listRows })
+    })
+  }
+
+  test('a denied hide after a held detail fit still lets the list return to its size', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    world.state.transcript = Fixtures.EDITED_TRANSCRIPT
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIALOG_DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const ui = await $.ui.mount({ ...Fixtures.INLINE_PANE, plugin: 'diff', surface: 'terminal' })
+    const listRows = world.placedRows[world.placedRows.length - 1]
+    const fitting = heldCall()
+    world.state.heldOpen = fitting.waiting
+    let denied = false
+    let hiding: Promise<unknown> | null = null
+    try {
+      await ui.press({ key: 'file:app.ts' })
+      await world.clock.settle()
+      world.state.denyClose = true
+      hiding = $.command.run(Fixtures.DIALOG_DIFF).catch(() => { denied = true })
+      await world.clock.settle()
+      fitting.release()
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      await hiding
+      await ui.select({ key: 'source', value: 'current' })
+      await world.clock.advance(Fixtures.SETTLE_MS)
+    } finally {
+      fitting.release()
+      await world.clock.settle()
+      await hiding
+      await ui.unmount()
+    }
+    expect({ denied, closes: world.closed.length, visible: world.pane.visible,
+      rows: world.placedRows[world.placedRows.length - 1] }).toEqual({
+      denied: true, closes: 1, visible: true, rows: listRows,
+    })
+  })
+
+  test('a detail fit held across clear cannot leave the retained list at the old detail size', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    world.state.transcript = Fixtures.EDITED_TRANSCRIPT
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIALOG_DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const ui = await $.ui.mount({ ...Fixtures.INLINE_PANE, plugin: 'diff', surface: 'terminal' })
+    const listRows = world.placedRows[world.placedRows.length - 1]
+    const fitting = heldCall()
+    world.state.heldOpen = fitting.waiting
+    try {
+      await ui.press({ key: 'file:app.ts' })
+      await world.clock.settle()
+      await $.command.run(Fixtures.CLEAR)
+      await world.clock.advance(Fixtures.SETTLE_MS)
+    } finally {
+      fitting.release()
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      await ui.unmount()
+    }
+    expect({ closes: world.closed.length, visible: world.pane.visible,
+      rows: world.placedRows[world.placedRows.length - 1] }).toEqual({
+      closes: 0, visible: true, rows: listRows,
+    })
+  })
+
+  test('returning to the current source while a detail fit is held restores the latest list size', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    world.state.transcript = Fixtures.EDITED_TRANSCRIPT
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIALOG_DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    const ui = await $.ui.mount({ ...Fixtures.INLINE_PANE, plugin: 'diff', surface: 'terminal' })
+    const listRows = world.placedRows[world.placedRows.length - 1]
+    expect(typeof listRows).toBe('number')
+    const initialOpens = world.opened.length
+    const fitting = heldCall()
+    world.state.heldOpen = fitting.waiting
+    try {
+      await ui.press({ key: 'file:app.ts' })
+      await world.clock.settle()
+      await ui.select({ key: 'source', value: 'current' })
+      await world.clock.settle()
+    } finally {
+      fitting.release()
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      await ui.unmount()
+    }
+    expect(world.opened.length).toBeGreaterThan(initialOpens)
+    expect(world.placedRows[world.placedRows.length - 1]).toBe(listRows)
+    expect(world.pane.visible).toBe(true)
+  })
+
+  test('hiding an inline pane waits for its earlier size fit to finish', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIALOG_DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    await $.ui.render(Fixtures.INLINE_PANE)
+    expect(world.pane.visible).toBe(true)
+    const initialOpens = world.opened.length
+    const fitting = heldCall()
+    world.state.heldOpen = fitting.waiting
+    let reply: unknown = 'pending'
+    let hiding: Promise<unknown> | null = null
+    let beforeRelease: unknown
+    try {
+      await $.ui.press({ plugin: 'diff', key: 'file:app.ts' })
+      await world.clock.settle()
+      hiding = $.command.run(Fixtures.DIALOG_DIFF).then(result => { reply = result })
+      await world.clock.settle()
+      beforeRelease = { fits: world.opened.length - initialOpens, closes: world.closed.length, reply }
+    } finally {
+      fitting.release()
+      await world.clock.settle()
+      await hiding
+      await world.clock.advance(Fixtures.SETTLE_MS)
+    }
+    expect({ beforeRelease, reply, visible: world.pane.visible }).toEqual({
+      beforeRelease: { fits: 1, closes: 0, reply: 'pending' },
+      reply: { text: Names.DIALOG_DISMISSED_TEXT },
+      visible: false,
+    })
+  })
+
+  test('a size fit requested during a successful hide cannot reopen the inline pane', async ($, on) => {
+    const world = lifecycleWorld(on, $)
+    await $.session.start(Fixtures.SESSION)
+    await $.command.run(Fixtures.DIALOG_DIFF)
+    await world.clock.advance(Fixtures.SETTLE_MS)
+    await $.ui.render(Fixtures.INLINE_PANE)
+    expect(world.pane.visible).toBe(true)
+    const initialOpens = world.opened.length
+    const closing = heldCall()
+    const fitting = heldCall()
+    world.state.heldClose = closing.waiting
+    const hiding = $.command.run(Fixtures.DIALOG_DIFF)
+    let beforeRelease: unknown
+    try {
+      await world.clock.settle()
+      world.state.heldOpen = fitting.waiting
+      await $.ui.press({ plugin: 'diff', key: 'file:app.ts' })
+      await world.clock.settle()
+      beforeRelease = { fits: world.opened.length - initialOpens, closes: world.closed.length }
+    } finally {
+      closing.release()
+      await world.clock.settle()
+      fitting.release()
+      await world.clock.advance(Fixtures.SETTLE_MS)
+    }
+    expect({ reply: await hiding, beforeRelease, fits: world.opened.length - initialOpens, visible: world.pane.visible }).toEqual({
+      reply: { text: Names.DIALOG_DISMISSED_TEXT },
+      beforeRelease: { fits: 0, closes: 1 },
+      fits: 0,
+      visible: false,
+    })
+  })
+
   test('review: unknown waiting cleanup stays ordered before a new session successor', async ($, on) => {
     const world = lifecycleWorld(on, $)
     await $.session.start(Fixtures.SESSION)

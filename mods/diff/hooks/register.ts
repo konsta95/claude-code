@@ -65,6 +65,19 @@ export function register(on: On) {
   let isPaneOpen = false
   let isPaneUnknown = false
   let openingPane: Promise<boolean> | null = null
+  type DialogFit = {
+    engine: Host
+    epoch: number
+    revision: number
+    focus: boolean
+  }
+  const paneOperations = {
+    tail: null as Promise<unknown> | null,
+    closes: new Set<Promise<boolean>>(),
+    revision: 0,
+    fit: null as DialogFit | null,
+    fitting: null as Promise<void> | null,
+  }
   let paneCloses = 0
   let dialogRows: number | null = null
   let hasAutoOpened = false
@@ -228,16 +241,67 @@ export function register(on: On) {
     }
   }
 
-  function fitDialog(engine: Host) {
+  function queuePane<T>(task: () => Promise<T>): Promise<T> {
+    const queued = (paneOperations.tail ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(task)
+    paneOperations.tail = queued
+    return queued.finally(() => {
+      if (paneOperations.tail === queued) paneOperations.tail = null
+    })
+  }
+
+  function fitDialog(engine: Host, focus = false) {
     const rows = Views.dialogRowsOf(model)
 
     const isStale =
-      isPaneOpen && model.isFullscreen === false && rows !== dialogRows
+      isPaneOpen && !isPaneUnknown && model.isFullscreen === false &&
+      (focus || rows !== dialogRows || paneOperations.fitting !== null)
 
     if (isStale) {
-      dialogRows = rows
-      void engine.openPane(dialogPane()).catch(() => undefined)
+      const previous = paneOperations.fit
+      paneOperations.fit = {
+        engine,
+        epoch: pin.epoch,
+        revision: paneOperations.revision,
+        focus: focus || (previous?.epoch === pin.epoch &&
+          previous.revision === paneOperations.revision && previous.focus),
+      }
+      drainDialogFit()
     }
+  }
+
+  function drainDialogFit() {
+    if (paneOperations.fitting !== null || paneOperations.fit === null) return
+    const queued = paneOperations.fit
+    const closes = [...paneOperations.closes]
+    const fitting = queuePane(async () => {
+      const request = paneOperations.fit
+      if (request?.epoch !== queued.epoch || request.revision !== queued.revision) return
+      paneOperations.fit = null
+      if (!request || request.epoch !== pin.epoch ||
+        request.revision !== paneOperations.revision ||
+        !isPaneOpen || isPaneUnknown || model.isFullscreen !== false) return
+
+      await Promise.allSettled(closes)
+      if (request.epoch !== pin.epoch || request.revision !== paneOperations.revision ||
+        !isPaneOpen || isPaneUnknown || model.isFullscreen !== false) return
+
+      const pane = dialogPane()
+      if (!request.focus && pane.rows === dialogRows) return
+      dialogRows = null
+      await request.engine.openPane({ ...pane, ...(request.focus && { focus: true }) })
+      if (request.epoch === pin.epoch && request.revision === paneOperations.revision && isPaneOpen) {
+        dialogRows = pane.rows ?? null
+      } else {
+        dialogRows = null
+      }
+    })
+    paneOperations.fitting = fitting
+    void fitting.catch(() => undefined).finally(() => {
+      if (paneOperations.fitting === fitting) paneOperations.fitting = null
+      drainDialogFit()
+    })
   }
 
   function redraw(engine: Host) {
@@ -483,20 +547,20 @@ export function register(on: On) {
     read: PaneState.Fetched | null = null,
   ): Promise<boolean> {
     const { epoch } = pin
+    const closes = [...paneOperations.closes]
     opens += 1
-    if (openingPane !== null) {
+    paneOperations.revision += 1
+    if (paneOperations.tail !== null || closes.length > 0) {
       engine.uiLog('The diff panel is waiting for an earlier pane operation to finish.')
     }
 
-    const opening = (openingPane ?? Promise.resolve(false))
-      .catch(() => false)
-      .then(() => {
-        if (epoch !== pin.epoch || isPaneUnknown) {
-          return false
-        }
+    const opening = queuePane(async () => {
+      if (epoch !== pin.epoch || isPaneUnknown) {
+        return false
+      }
 
-        return isPaneOpen || placePane(engine, trigger, read)
-      })
+      return isPaneOpen || placePane(engine, trigger, read, closes)
+    })
 
     openingPane = opening
 
@@ -511,6 +575,7 @@ export function register(on: On) {
     engine: Host,
     trigger: (typeof Record.SHOWN_TRIGGERS)[number],
     read: PaneState.Fetched | null,
+    closes: readonly Promise<boolean>[],
   ): Promise<boolean> {
     const { epoch } = pin
     const owner = lifecycle.owner()
@@ -533,7 +598,8 @@ export function register(on: On) {
       await refresh(engine).catch(() => undefined)
     }
 
-    if (!(await lifecycle.waitForPaneCloses(owner)) || epoch !== pin.epoch) {
+    await Promise.allSettled(closes)
+    if (epoch !== pin.epoch) {
       return false
     }
 
@@ -727,12 +793,23 @@ export function register(on: On) {
 
   async function closePane(engine: Host, isCleanup = false): Promise<boolean> {
     const owner = lifecycle.owner()
-    return (await lifecycle.run(isCleanup ? 'pane-cleanup' : 'pane-close', owner, async () => {
-      await engine.closePane({ id: Names.PANE_ID })
-      isPaneOpen = false
-      isPaneUnknown = false
-      return true
-    }, true)) ?? false
+    const placements = paneOperations.tail
+    if (paneOperations.tail !== null) {
+      engine.uiLog('The diff panel is waiting for an earlier pane operation to finish.')
+    }
+    const closing = lifecycle.run(
+      isCleanup ? 'pane-cleanup' : 'pane-close', owner, async () => {
+        await placements?.catch(() => undefined)
+        if (!lifecycle.isSession(owner)) return false
+        await engine.closePane({ id: Names.PANE_ID })
+        paneOperations.revision += 1
+        isPaneOpen = false
+        isPaneUnknown = false
+        return true
+      }, true,
+    ).then(result => result ?? false)
+    paneOperations.closes.add(closing)
+    return closing.finally(() => { paneOperations.closes.delete(closing) })
   }
 
   function markTabSwitch(engine: Host, tab: (typeof Record.TABS)[number]) {
@@ -1201,11 +1278,7 @@ export function register(on: On) {
       model = { ...model, dialogView: 'list' }
       redraw(host)
 
-      dialogRows = Views.dialogRowsOf(model)
-
-      void host
-        .openPane({ ...dialogPane(), focus: true })
-        .catch(() => undefined)
+      fitDialog(host, true)
 
       return { deny: 'back to the file list' }
     }
