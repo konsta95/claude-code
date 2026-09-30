@@ -18,6 +18,10 @@ jobs:
   diff-regression:
     name: Diff tests and mod typecheck
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        claude-code: ["2.1.284", "2.1.286"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -25,10 +29,18 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Claude Code and TypeScript
+        shell: bash
         run: |
-          npm install -g @anthropic-ai/claude-code@2.1.284 typescript@5.9.3
-          claude --version
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" typescript@5.9.3
+          installed=$(claude --version)
+          echo "$installed"
+          if [[ "$installed" != "$CLAUDE_CODE_VERSION "* ]]; then
+            echo "Expected Claude Code $CLAUDE_CODE_VERSION on PATH; refusing to test another version" >&2
+            exit 1
+          fi
           tsc --version
+        env:
+          CLAUDE_CODE_VERSION: ${{ matrix.claude-code }}
 
       - name: Typecheck every mod's hooks and tests
         run: tsc -p mods/tsconfig.json
