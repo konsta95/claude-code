@@ -95,14 +95,14 @@ export function register(on: On) {
   let bodyStamp: string | null = null
   let bodyBase: string | null = null
 
-  const bodyLoads = new Map<string, Promise<Git.FileHunks | null | undefined>>()
+  const bodyLoads = new Set<string>()
 
   const polled = { toplevel: '', headKey: '' }
   const lifecycle = new Lifecycle(2, kind => {
     host?.uiLog(kind === 'pane-close' || kind === 'pane-cleanup'
       ? 'The diff panel is waiting for an earlier pane operation to finish.'
       : 'The diff panel is waiting for earlier work to finish; it will refresh when that work settles.')
-  }, Limits.BODY_FETCH_CONCURRENCY)
+  }, 1)
   const pin = {
     cwd: '',
     isEmpty: false,
@@ -363,28 +363,31 @@ export function register(on: On) {
     const owner = lifecycle.owner()
     lifecycle.beginBodies(owner, stamp)
 
-    function loadOf(file: Git.FileStat): Promise<Git.FileHunks | null | undefined> {
-      if (!lifecycle.isCurrent(owner)) return Promise.resolve(undefined)
-      const load = lifecycle.runBody(owner, stamp, () => pinned.fetchFileHunks(data, file))
-      bodyLoads.set(file.path, load)
+    const files = drawnFilesOf(model).filter(file => !bodyLoads.has(file.path))
 
-      return load.then(body => {
-        if (body !== undefined && lifecycle.isCurrent(owner) && bodyStamp === stamp) {
-          model = {
-            ...model,
-            bodies: new Map(model.bodies).set(file.path, body),
-          }
-
-          redraw(engine)
-        }
-
-        return body
-      })
+    if (files.length === 0) {
+      return false
     }
 
-    return (
-      await Promise.all(drawnFilesOf(model).filter(file => !bodyLoads.has(file.path)).map(loadOf))
-    ).includes(null)
+    for (const file of files) {
+      bodyLoads.add(file.path)
+    }
+
+    const isWanted = () => lifecycle.isCurrent(owner) && bodyStamp === stamp
+    const read = await lifecycle.runBody(owner, stamp, () => pinned.fetchHunks(data, files, isWanted))
+
+    if (read === undefined) {
+      return false
+    }
+
+    const isCurrent = isWanted() && read.size > 0
+
+    if (isCurrent) {
+      model = { ...model, bodies: new Map([...model.bodies, ...read]) }
+      redraw(engine)
+    }
+
+    return [...read.values()].includes(null)
   }
 
   function keepBaseline() {

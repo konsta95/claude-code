@@ -143,7 +143,7 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
     }
     if (e.argv.includes('--') && !line.includes('ls-files')) {
       counts.bodies += 1
-      bodyPaths.push(e.argv[e.argv.length - 1]!)
+      bodyPaths.push(...e.argv.slice(e.argv.indexOf('--') + 1))
       const fails = state.failBody
       const held = state.heldBody ?? state.heldBodies
       state.heldBody = null
@@ -995,7 +995,7 @@ describe('owner-lifecycle', () => {
 
   test('body capacity retains old filter work and recovers only the newest session', async ($, on) => {
     const world = lifecycleWorld(on, $)
-    const paths = ['app.ts', ...Array.from({ length: Limits.BODY_FETCH_CONCURRENCY }, (_, at) => `body${at}.test.ts`)]
+    const paths = ['app.ts', 'body0.test.ts', 'body1.test.ts']
     Object.assign(world.script, Fixtures.answersOf(
       paths.map(path => `1\t1\t${path}\0`).join(''),
       Object.fromEntries(paths.map(path => [path, '@@ -1 +1 @@\n-old\n+old_body\n'])),
@@ -1020,18 +1020,21 @@ describe('owner-lifecycle', () => {
     }
     const saturated = { bodies: world.counts.bodies - before, logs: [...world.logs] }
     world.state.heldBodies = null
+    const pathStart = world.bodyPaths.length
     first.release()
     await world.clock.advance(Fixtures.SETTLE_MS)
     const recovered = {
       bodies: world.counts.bodies,
+      paths: world.bodyPaths.slice(pathStart),
       text: Fixtures.textOf(await $.ui.render(Fixtures.PANE)),
     }
     second.release()
     await world.clock.advance(Fixtures.SETTLE_MS)
-    expect(saturated.bodies).toBe(2 * Limits.BODY_FETCH_CONCURRENCY)
+    expect(saturated.bodies).toBe(2)
     expect(saturated.logs.join('\n')).toContain('waiting for earlier work')
     expect(recovered.text).toContain('+recovered_body')
-    expect(recovered.bodies).toBe(before + 2 * Limits.BODY_FETCH_CONCURRENCY + paths.length)
+    expect(recovered.bodies).toBe(before + 2 + 1)
+    expect([...recovered.paths].sort()).toEqual([...paths].sort())
     expect(world.counts.bodies).toBe(recovered.bodies)
     expect(Fixtures.textOf(await $.ui.render(Fixtures.PANE))).toContain('+recovered_body')
   })
@@ -1064,7 +1067,7 @@ describe('owner-lifecycle', () => {
     await world.clock.advance(Fixtures.SETTLE_MS)
     const paths = world.bodyPaths.slice(pathStart)
     expect({ whileHeld, paths: paths.length, unique: new Set(paths).size }).toEqual({
-      whileHeld: Limits.BODY_FETCH_CONCURRENCY,
+      whileHeld: 1,
       paths: Fixtures.MANY_FILE_COUNT + 1,
       unique: Fixtures.MANY_FILE_COUNT + 1,
     })
@@ -1531,26 +1534,68 @@ describe('owner-lifecycle', () => {
 
   test('skipping undispatched bodies after clear is not a Git failure', { plugins: [RECORDING] }, async ($, on) => {
     const world = lifecycleWorld(on, $)
+    const paths = ['app.ts', 'body0.test.ts', 'body1.test.ts']
+    Object.assign(world.script, Fixtures.answersOf(
+      paths.map(path => `1\t1\t${path}\0`).join(''),
+      Object.fromEntries(paths.map(path => [path, '@@ -1 +1 @@\n-old\n+old_body\n'])),
+    ))
     await $.session.start(Fixtures.SESSION)
     await $.command.run(Fixtures.DIFF)
     await world.clock.advance(Fixtures.SETTLE_MS)
+    await $.ui.render(Fixtures.PANE)
     world.marks.length = 0
-    Object.assign(world.script, Fixtures.MANY_FILES)
+    const before = world.counts.bodies
     const held = heldCall()
     world.state.heldBodies = held.waiting
-    await $.tool.call({ tool: 'Bash', command: 'make' })
-    await world.clock.advance(Limits.REFRESH_DEBOUNCE_MS)
-    const entered = world.counts.bodies
+    await $.ui.press({ plugin: 'diff', key: 'noise' })
+    await world.clock.settle()
+    for (let i = 0; i < 2; i += 1) {
+      await $.command.run(Fixtures.CLEAR)
+      await world.clock.settle()
+    }
+    const entered = { bodies: world.counts.bodies - before, logs: [...world.logs] }
     world.state.heldBodies = null
     Object.assign(world.script, MOVED)
     await $.command.run(Fixtures.CLEAR)
     held.release()
     await world.clock.advance(Fixtures.SETTLE_MS)
 
-    expect(entered).toBe(1 + Limits.BODY_FETCH_CONCURRENCY)
+    expect(entered.bodies).toBe(2)
+    expect(entered.logs.join('\n')).toContain('waiting for earlier work')
     expect(world.marks).toEqual(['ok'])
     expect(Fixtures.textOf(await $.ui.render(Fixtures.PANE))).toContain('other.ts')
   })
+
+  for (const change of ['/clear', 'a base switch'] as const) {
+    test(`a split hunks read revoked by ${change} starts no further child`, async ($, on) => {
+      const world = lifecycleWorld(on, $)
+      await $.session.start(Fixtures.SESSION)
+      await $.command.run(Fixtures.DIFF)
+      await world.clock.advance(Fixtures.SETTLE_MS)
+      const long = ['a', 'b', 'c'].map(name => name.repeat(Limits.MAX_PATHSPEC_CHARS / 2))
+      Object.assign(world.script, Fixtures.answersOf(
+        long.map(path => `1\t0\t${path}\0`).join(''),
+        Object.fromEntries(long.map(path => [path, '@@ -1 +1 @@\n-old\n+new\n'])),
+      ))
+      const held = heldCall()
+      world.state.heldBody = held.waiting
+      const pathStart = world.bodyPaths.length
+      await $.tool.call({ tool: 'Bash', command: 'make' })
+      await world.clock.advance(Limits.REFRESH_DEBOUNCE_MS)
+      await $.ui.render(Fixtures.PANE)
+      const asked = world.bodyPaths.slice(pathStart)
+      Object.assign(world.script, MOVED)
+      if (change === '/clear') await $.command.run(Fixtures.CLEAR)
+      else await $.ui.press({ plugin: 'diff', key: 'base' })
+      await world.clock.settle()
+      held.release()
+      await world.clock.advance(Fixtures.SETTLE_MS)
+
+      expect(asked, 'the first child is asked the paths within the budget').toEqual(long.slice(0, 2))
+      expect(world.bodyPaths).not.toContain(long[2])
+      expect(Fixtures.textOf(await $.ui.render(Fixtures.PANE))).toContain('other.ts')
+    })
+  }
 
   test('capacity saturation reports waiting and retries the latest base when old work settles', async ($, on) => {
     const world = lifecycleWorld(on, $)
