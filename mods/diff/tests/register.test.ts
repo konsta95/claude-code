@@ -1305,7 +1305,9 @@ describe('register', () => {
     expect(world.closed, 'the pane stayed up across /clear').toEqual([])
 
     expect(
-      logged.kept.map(shown => shown.props?.trigger),
+      logged.kept.map(shown =>
+        'props' in shown ? shown.props?.trigger : undefined,
+      ),
       "once a conversation: Claude's edit opened the first, and the second, " +
         "which nobody opened, reads as the person's, as the built-in's does",
     ).toEqual([
