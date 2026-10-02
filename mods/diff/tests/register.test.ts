@@ -693,7 +693,7 @@ describe('register', () => {
     on('ui.open', async () => {
       drawnAtOpen.push(Fixtures.textOf(await $.ui.render(Fixtures.PANE)))
 
-      return { value: undefined }
+      return { value: { isPlaced: true } as never }
     })
 
     on('ui.invalidate', () => ({ value: undefined }))
@@ -1210,7 +1210,7 @@ describe('register', () => {
     on('ui.open', ($, e) => {
       opened.push(e.id)
 
-      return { value: undefined }
+      return { value: { isPlaced: true } as never }
     })
 
     on('ui.close', () => ({ value: undefined }))

@@ -39,7 +39,11 @@ export function inSlowRepository(
     return { value }
   })
 
-  on('ui.open', opened.hook)
+  on('ui.open', (engine, e) => {
+    opened.hook(engine, e)
+
+    return { value: { isPlaced: true } as never }
+  })
   on('ui.close', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.invalidate', () => ({ value: undefined }))

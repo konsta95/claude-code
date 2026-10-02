@@ -256,7 +256,7 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
       openReplyFailures.push('refusal')
       return { deny: 'test open refused after placement' }
     }
-    return { value: undefined }
+    return { value: { isPlaced: true } as never }
   })
   on('ui.panes', async () => {
     counts.panes += 1
