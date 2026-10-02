@@ -323,8 +323,8 @@ function lifecycleWorld(on: On, drive: Engine, stored: Record<string, unknown> =
 function filesWrittenAt(on: On, mtimeMs: number) {
   on('fs.list', () => ({
     value: [
-      { name: 'app.ts', kind: 'file', size: 2, isLink: false },
-      { name: 'other.ts', kind: 'file', size: 2, isLink: false },
+      { name: 'app.ts', kind: 'file', size: 2, mtimeMs, isLink: false },
+      { name: 'other.ts', kind: 'file', size: 2, mtimeMs, isLink: false },
     ],
   }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 2, mtimeMs, isLink: false } }))
