@@ -982,6 +982,7 @@ export function register(on: On) {
         place: isDocked ? Views.placeAtFile(model, path) : model.place,
       }
 
+      void loadBodies(engine).catch(() => undefined)
       redraw(engine)
     },
     scrollList: delta => {
@@ -1191,6 +1192,15 @@ export function register(on: On) {
 
     columns = e.viewport?.columns ?? columns
 
+    /**
+     * A seat that changed since the last drawing lists other rows, whose
+     * bodies are read once.
+     *
+     * The model takes the new seat in this same pass, so the drawing that
+     * read asks for finds the seat unchanged.
+     */
+    const isReseated = e.props.placement !== model.placement
+
     model = {
       ...model,
       placement: e.props.placement,
@@ -1202,6 +1212,10 @@ export function register(on: On) {
         ),
         rows: e.props.scroll.bodyRows,
       },
+    }
+
+    if (isReseated) {
+      void loadBodies(host).catch(() => undefined)
     }
 
     return Views.paneView(
@@ -1313,13 +1327,9 @@ export function register(on: On) {
       paneTrigger = null
     }
 
-    const isDialog = model.isFullscreen === false
+    const isDocking = model.isFullscreen !== false
 
-    if (isPersons && host && isDialog) {
-      host.uiLog(Names.DIALOG_DISMISSED_TEXT)
-    }
-
-    if (isPersons && host && !isDialog) {
+    if (isPersons && host && isDocking) {
       markTabSwitch(host, 'convo')
       await host.storeSet(Names.STORE_OPEN_KEY, false).catch(() => undefined)
     }
@@ -1342,6 +1352,7 @@ export function register(on: On) {
     }
 
     model = { ...model, selectedPath: focus.selectedPath }
+    void loadBodies(host).catch(() => undefined)
     fitDialog(host)
     host.invalidate()
 
