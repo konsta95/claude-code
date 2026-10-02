@@ -970,7 +970,12 @@ export function register(on: On) {
 
   on(
     'tool.call',
-    { tool: [...Tools.EDITING_TOOLS, ...Tools.SHELL_TOOLS] },
+    {
+      tool: [
+        ...Tools.EDITING_TOOLS,
+        ...Tools.SHELL_TOOLS.map(name => new RegExp('^' + name + '$')),
+      ],
+    },
     async ($, e, next) => {
       let result: ResultOf['tool.call'] | undefined
 
