@@ -63,7 +63,7 @@ export function inRepository(
     if (!isWaiting) {
       opened.hook(engine, e)
 
-      return { value: { isPlaced: true } as never }
+      return { value: { isPlaced: true } }
     }
 
     waiting.push(e)

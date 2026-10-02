@@ -2167,7 +2167,7 @@ declare module 'claude-code' {
            * @example
            * await $.ui.open({ id: "ask", focus: true, closeOnEscape: true, rows: 9 })
            */
-          open: (pane: PaneOpenArgs) => Promise<void>;
+          open: (pane: PaneOpenArgs) => Promise<UiOpenResult>;
           /**
            * Closes one of the open panes; an id that is not open is left alone.
            *
@@ -5859,7 +5859,7 @@ declare module 'claude-code' {
       'ui.log': void;
       'ui.notice': void;
       'ui.invalidate': void;
-      'ui.open': void;
+      'ui.open': UiOpenResult;
       'ui.close': void;
       /**
        * The calling plugin's open panes, placed then unplaced, in open order.
@@ -10872,6 +10872,52 @@ declare module 'claude-code' {
        * props are; absent leaves the instance's props as they were.
        */
       props?: unknown;
+  };
+
+  /**
+   * What `$.ui.open` resolves to and what a `ui.open` hook's `{ value }` holds.
+   *
+   * Whether a surface draws the pane now, in `$.ui.panes()`' word
+   * (`isPlaced`).
+   *
+   * Asked (the hook of a command the person typed or a prompt they entered, a
+   * Button, Input or Select they worked; never a timer, `session.start`, a
+   * queued prompt, nor `focus`) a pane is placed at any width: docked beside a
+   * fullscreen transcript from 110 columns, else inline above the prompt.
+   * Unasked it is placed from 144 terminal columns (110 for an id the person
+   * opened from this plugin before, in this session or an earlier one, and
+   * has not closed by hand since) and waits undrawn below that, no
+   * `ui.render` raised, until the person opens it or the terminal widens to
+   * the floor. Where a surface seated it (`dock`, `inline`) is on the `Pane`
+   * render props, per surface; a plugin's tests answer with a hook beneath.
+   *
+   * @example
+   * const opened = await $.ui.open({ id: "clock" })
+   */
+  export type UiOpenResult = {
+      /**
+       * True: the pane is open and drawn (or retitled in place); the first
+       * `ui.render` for `{ component: "Pane", requestId: id }` follows.
+       */
+      isPlaced: true;
+  } | {
+      /**
+       * False: the pane is open but waits undrawn: opened unasked on a narrow
+       * terminal, or in a session whose attached surfaces place no panes.
+       */
+      isPlaced: false;
+      /**
+       * Why it waits and what seats it: the floor it fell under (144 columns
+       * unasked, 110 for an id the person once opened) and the width now.
+       *
+       * Or the attached surfaces that place nothing (an older desktop); it is
+       * seated when one that places panes attaches. With no terminal measured
+       * and no surface attached (a bare `-p` run) this arm never comes back.
+       *
+       * @example
+       * on('ui.open', { id }, () => ({ value: { isPlaced: false, reason } }))
+       */
+      reason: string;
   };
 
   /**

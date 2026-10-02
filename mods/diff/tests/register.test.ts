@@ -719,7 +719,7 @@ describe('register', () => {
     on('ui.open', ($, e) => {
       opened.push(e.id)
 
-      return { value: { isPlaced: true } as never }
+      return { value: { isPlaced: true } }
     })
 
     on('ui.close', () => ({ value: undefined }))
