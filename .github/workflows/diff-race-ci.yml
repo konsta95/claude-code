@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        claude-code: ["2.1.284", "2.1.286"]
+        claude-code: ["2.1.284", "2.1.286", "2.1.289"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
