@@ -233,7 +233,6 @@ export function register(on: On) {
     return {
       id: Names.PANE_ID,
       title: Names.PANE_TITLE,
-      holdToasts: true,
       closeOnEscape: true,
       rows: Views.dialogRowsOf(model),
     }
@@ -629,7 +628,7 @@ export function register(on: On) {
       const opened = await engine.openPane(
         isDialog
           ? { ...dialogPane(), focus: true }
-          : { id: Names.PANE_ID, title: Names.PANE_TITLE, holdToasts: true },
+          : { id: Names.PANE_ID, title: Names.PANE_TITLE },
       )
 
       isWaiting = isRecord(opened) && opened.isPlaced === false

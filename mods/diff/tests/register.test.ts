@@ -359,9 +359,7 @@ describe('register', () => {
       '--show-toplevel',
     )
 
-    expect(world.opened).toEqual([
-      { id: 'diff', title: 'Diff', holdToasts: true },
-    ])
+    expect(world.opened).toEqual([{ id: 'diff', title: 'Diff' }])
 
     await world.clock.advance(Fixtures.SETTLE_MS)
 
@@ -381,7 +379,6 @@ describe('register', () => {
     expect(world.opened[0]).toEqual({
       id: 'diff',
       title: 'Diff',
-      holdToasts: true,
       closeOnEscape: true,
       rows: expect.any(Number),
       focus: true,
