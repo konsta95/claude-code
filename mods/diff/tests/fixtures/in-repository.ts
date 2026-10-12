@@ -61,7 +61,9 @@ export function inRepository(
     const isWaiting = beneath.isLeftWaiting?.() === true
 
     if (!isWaiting) {
-      return opened.hook(engine, e)
+      opened.hook(engine, e)
+
+      return { value: { isPlaced: true } as never }
     }
 
     waiting.push(e)

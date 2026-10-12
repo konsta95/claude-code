@@ -119,7 +119,7 @@ describe('git', () => {
       value: Fixtures.gitIn(e.argv, Fixtures.MOVED_IN),
     }))
 
-    on('ui.open', () => ({ value: undefined }))
+    on('ui.open', () => ({ value: { isPlaced: true } as never }))
     on('ui.invalidate', () => ({ value: undefined }))
     on('session.messages', () => ({ value: [] }))
     Fixtures.oldFiles(on)
@@ -145,11 +145,12 @@ describe('git', () => {
       value: Fixtures.gitIn(e.argv, Fixtures.MOVED_IN),
     }))
 
-    on('ui.open', () => ({ value: undefined }))
+    on('ui.open', () => ({ value: { isPlaced: true } as never }))
     on('ui.invalidate', () => ({ value: undefined }))
     on('session.messages', () => ({ value: [] }))
     on('session.usage', () => ({ value: Fixtures.usageAt(startedAt) }))
-    on('command.run', { command: 'clear' }, () => ({}))
+    const switchSession = Fixtures.switchSessions(on, $)
+    on('command.run', { command: 'clear' }, () => switchSession('clear'))
     Fixtures.oldFiles(on)
     mock.store(on)
 

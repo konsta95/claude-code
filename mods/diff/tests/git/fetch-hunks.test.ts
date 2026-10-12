@@ -177,6 +177,21 @@ describe('fetch-hunks', () => {
     )
   })
 
+  test('a read no longer wanted asks no further child', async () => {
+    let isWanted = true
+
+    const git = gitOf(asked => {
+      isWanted = false
+
+      return Fixtures.hunksReadOf(asked)
+    })
+
+    const read = await Git.fetchHunks(git.run, dataOf(LONG), LONG, () => isWanted)
+
+    expect(git.asks).toHaveLength(1)
+    expect([...read.keys()]).toEqual(LONG.slice(0, 2).map(file => file.path))
+  })
+
   test('one path past the budget is still asked, alone', async () => {
     const git = gitOf()
     const files = [rowOf('d'.repeat(Limits.MAX_PATHSPEC_CHARS + 1)), rowOf('e')]

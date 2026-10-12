@@ -16,8 +16,10 @@ import type Git from './git'
 import type { Host } from './host'
 import { isCheckpointing } from './is-checkpointing'
 import { isOnPaneSurface } from './is-on-pane-surface'
+import { isOutsideWorkingTree } from './is-outside-working-tree'
 import { isRecord } from './is-record'
 import Limits from './limits'
+import { Lifecycle } from './lifecycle'
 import { messageOf } from './message-of'
 import { mtimeOf } from './mtime-of'
 import Names from './names'
@@ -34,54 +36,102 @@ import Views from './views'
  *
  * Git runs when the built-in's would: none at the start; `/diff` or the main
  * loop's first checkpointed edit with room pins the backend, until `/clear`,
- * which reads afresh under a pane it leaves open.
+ * which reads afresh under a pane it leaves open; such an edit inside the
+ * tree fetches until one lists a file to open on.
  *
  * @param on the engine's registrar
  */
 export function register(on: On) {
   let host: Host | null = null
   let backend: Backend.Backend | null = null
-  let probing: Promise<boolean> | null = null
   let sessionStartMs = 0
+  let sessionStartReady: Promise<boolean> = Promise.resolve(true)
+  type SessionChange = {
+    owner: ReturnType<Lifecycle['owner']>
+    endedId: string
+    reason: 'clear' | 'resume'
+    phase: 'pending' | 'initializing' | 'unavailable' | 'ready'
+    requested: number
+    attempted: number
+    release: (ready: boolean) => void
+  }
+  type PaneLookup =
+    | { kind: 'placed' | 'waiting' | 'absent' }
+    | { kind: 'unknown'; reason: string }
+  let sessionChange: SessionChange | null = null
   let isPaneOpen = false
+  let isPaneUnknown = false
+  let openingPane: Promise<boolean> | null = null
+  type DialogFit = {
+    engine: Host
+    epoch: number
+    revision: number
+    focus: boolean
+  }
+  const paneOperations = {
+    tail: null as Promise<unknown> | null,
+    closes: new Set<Promise<boolean>>(),
+    revision: 0,
+    fit: null as DialogFit | null,
+    fitting: null as Promise<void> | null,
+  }
+  let paneCloses = 0
   let dialogRows: number | null = null
   let hasAutoOpened = false
   let hasRestoredEdits = false
+  let landed = 0
+  let opens = 0
   let columns: number | null = null
   let shownSessionId: string | null = null
+  let paneTrigger: (typeof Record.SHOWN_TRIGGERS)[number] | null = null
   let armed: Ask.ArmedAsk | null = null
   let carrying: Ask.ArmedAsk | null = null
-  let isRefreshing = false
-  let isRefreshQueued = false
+  let queuedRefresh: {
+    owner: ReturnType<Lifecycle['owner']>
+    engine: Host
+    read: PaneState.Fetched | null
+  } | null = null
   let generation = 0
-  let landed = 0
   let bodyStamp: string | null = null
   let bodyBase: string | null = null
 
   const bodyLoads = new Set<string>()
 
   const polled = { toplevel: '', headKey: '' }
-  const pin = { cwd: '', isEmpty: false, epoch: 0 }
+  const lifecycle = new Lifecycle(2, kind => {
+    host?.uiLog(kind === 'pane-close' || kind === 'pane-cleanup'
+      ? 'The diff panel is waiting for an earlier pane operation to finish.'
+      : 'The diff panel is waiting for earlier work to finish; it will refresh when that work settles.')
+  }, 1)
+  const pin = {
+    cwd: '',
+    isEmpty: false,
+    get epoch() { return lifecycle.owner().session },
+  }
 
   let model: PaneState.PaneModel = PaneState.INITIAL_MODEL
 
   const timers = new Map<'refresh' | 'redraw' | 'poll', Timer>()
   const loggedBaseKinds = new Set<'ok' | 'sad'>()
 
-  const currentOf = (engine: Host): Host => host ?? engine
-
-  const backendHostOf = (engine: Host): Backend.BackendHost => ({
+  const backendHostOf = (
+    engine: Host,
+    owner: ReturnType<Lifecycle['owner']>,
+    cwd: string,
+    startedAt: number,
+  ): Backend.BackendHost => ({
     run: (argv, init) =>
-      currentOf(engine).run(
+      engine.run(
         argv,
-        pin.cwd === '' ? init : { cwd: pin.cwd, ...init },
+        cwd === '' ? init : { cwd, ...init },
       ),
-    readFile: path => currentOf(engine).readFile(path),
-    mtimeOf: path => mtimeOf(currentOf(engine))(path),
-    entryKindsOf: dir => entryKindsOf(currentOf(engine))(dir),
-    nowMs: () => currentOf(engine).now(),
-    sessionStartMsOf: () => sessionStartMs,
+    readFile: path => engine.readFile(path),
+    mtimeOf: path => mtimeOf(engine)(path),
+    entryKindsOf: dir => entryKindsOf(engine)(dir),
+    nowMs: () => engine.now(),
+    sessionStartMsOf: () => startedAt,
     onBranchBase: base => {
+      if (!lifecycle.isSession(owner)) return
       const isError = base.kind === 'error'
 
       const outcome: Record.MarkOutcome = isError
@@ -96,7 +146,7 @@ export function register(on: On) {
       if (!loggedBaseKinds.has(outcome.kind)) {
         loggedBaseKinds.add(outcome.kind)
 
-        Record.recorderOf(currentOf(engine)).mark(
+        Record.recorderOf(engine).mark(
           Record.FEATURES.baseResolve,
           outcome,
         )
@@ -104,22 +154,24 @@ export function register(on: On) {
     },
   })
 
-  function pinBackend(engine: Host): Promise<boolean> {
+  async function pinBackend(engine: Host): Promise<boolean> {
+    requestSessionConfirmation(engine)
     if (backend || pin.isEmpty) {
       return Promise.resolve(true)
     }
 
-    probing ??= probeBackend(engine).finally(() => {
-      probing = null
-    })
-
-    return probing
+    const owner = lifecycle.owner()
+    return (await lifecycle.run('probe', owner, () => probeBackend(engine, owner))) ?? false
   }
 
-  async function probeBackend(engine: Host): Promise<boolean> {
+  async function probeBackend(
+    engine: Host,
+    owner: ReturnType<Lifecycle['owner']>,
+  ): Promise<boolean> {
     const asked = { isAnswered: true }
-    const probeHost = backendHostOf(engine)
-    const { epoch } = pin
+    const cwd = pin.cwd
+    if (!(await waitForSessionStart(engine, owner))) return false
+    const probeHost = backendHostOf(engine, owner, cwd, sessionStartMs)
 
     const probed = await Backend.backendOf(
       {
@@ -135,24 +187,24 @@ export function register(on: On) {
       Backend.INSTALLED_BACKEND_PROBES,
     )
 
-    if (epoch !== pin.epoch) {
+    if (!lifecycle.isCurrent(owner)) {
       return false
     }
 
-    backend ??= probed
-    pin.isEmpty = backend === null && asked.isAnswered
-
-    if (!probed || backend !== probed) {
-      return asked.isAnswered || backend !== null
+    if (!probed) {
+      pin.isEmpty = asked.isAnswered
+      return asked.isAnswered
     }
-
-    startPoll(engine, probed)
 
     const stored = PaneState.baseModeOf(
       await engine
         .storeGet(Names.baseStoreKeyOf(probed.repository.toplevel))
         .catch(() => undefined),
     )
+
+    if (!lifecycle.isCurrent(owner)) return false
+    backend = probed
+    startPoll(engine, probed)
 
     const mode = stored && probed.baseModes.includes(stored) ? stored : null
 
@@ -169,7 +221,8 @@ export function register(on: On) {
   function unpin() {
     backend = null
     pin.isEmpty = false
-    pin.epoch += 1
+    lifecycle.advance(true)
+    queuedRefresh = null
     polled.toplevel = ''
     polled.headKey = ''
     timers.get('poll')?.cancel()
@@ -185,16 +238,67 @@ export function register(on: On) {
     }
   }
 
-  function fitDialog(engine: Host) {
+  function queuePane<T>(task: () => Promise<T>): Promise<T> {
+    const queued = (paneOperations.tail ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(task)
+    paneOperations.tail = queued
+    return queued.finally(() => {
+      if (paneOperations.tail === queued) paneOperations.tail = null
+    })
+  }
+
+  function fitDialog(engine: Host, focus = false) {
     const rows = Views.dialogRowsOf(model)
 
     const isStale =
-      isPaneOpen && model.isFullscreen === false && rows !== dialogRows
+      isPaneOpen && !isPaneUnknown && model.isFullscreen === false &&
+      (focus || rows !== dialogRows || paneOperations.fitting !== null)
 
     if (isStale) {
-      dialogRows = rows
-      void engine.openPane(dialogPane()).catch(() => undefined)
+      const previous = paneOperations.fit
+      paneOperations.fit = {
+        engine,
+        epoch: pin.epoch,
+        revision: paneOperations.revision,
+        focus: focus || (previous?.epoch === pin.epoch &&
+          previous.revision === paneOperations.revision && previous.focus),
+      }
+      drainDialogFit()
     }
+  }
+
+  function drainDialogFit() {
+    if (paneOperations.fitting !== null || paneOperations.fit === null) return
+    const queued = paneOperations.fit
+    const closes = [...paneOperations.closes]
+    const fitting = queuePane(async () => {
+      const request = paneOperations.fit
+      if (request?.epoch !== queued.epoch || request.revision !== queued.revision) return
+      paneOperations.fit = null
+      if (!request || request.epoch !== pin.epoch ||
+        request.revision !== paneOperations.revision ||
+        !isPaneOpen || isPaneUnknown || model.isFullscreen !== false) return
+
+      await Promise.allSettled(closes)
+      if (request.epoch !== pin.epoch || request.revision !== paneOperations.revision ||
+        !isPaneOpen || isPaneUnknown || model.isFullscreen !== false) return
+
+      const pane = dialogPane()
+      if (!request.focus && pane.rows === dialogRows) return
+      dialogRows = null
+      await request.engine.openPane({ ...pane, ...(request.focus && { focus: true }) })
+      if (request.epoch === pin.epoch && request.revision === paneOperations.revision && isPaneOpen) {
+        dialogRows = pane.rows ?? null
+      } else {
+        dialogRows = null
+      }
+    })
+    paneOperations.fitting = fitting
+    void fitting.catch(() => undefined).finally(() => {
+      if (paneOperations.fitting === fitting) paneOperations.fitting = null
+      drainDialogFit()
+    })
   }
 
   function redraw(engine: Host) {
@@ -218,6 +322,7 @@ export function register(on: On) {
     const pinned = backend
 
     if (!data || !pinned) {
+      lifecycle.clearBodies()
       bodyStamp = null
       bodyBase = null
       bodyLoads.clear()
@@ -243,7 +348,10 @@ export function register(on: On) {
     return fetchBodies(engine, pinned, data)
   }
 
-  const bodyStampOf = (data: Git.DiffData) => `${generation}|${data.baseRef}`
+  const bodyStampOf = (data: Git.DiffData) => {
+    const { session, view } = lifecycle.owner()
+    return `${session}|${view}|${generation}|${data.baseRef}`
+  }
 
   async function fetchBodies(
     engine: Host,
@@ -251,15 +359,27 @@ export function register(on: On) {
     data: Git.DiffData,
   ): Promise<boolean> {
     const stamp = bodyStampOf(data)
+    const owner = lifecycle.owner()
+    lifecycle.beginBodies(owner, stamp)
 
     const files = drawnFilesOf(model).filter(file => !bodyLoads.has(file.path))
+
+    if (files.length === 0) {
+      return false
+    }
 
     for (const file of files) {
       bodyLoads.add(file.path)
     }
 
-    const read = await pinned.fetchHunks(data, files)
-    const isCurrent = bodyStamp === stamp && read.size > 0
+    const isWanted = () => lifecycle.isCurrent(owner) && bodyStamp === stamp
+    const read = await lifecycle.runBody(owner, stamp, () => pinned.fetchHunks(data, files, isWanted))
+
+    if (read === undefined) {
+      return false
+    }
+
+    const isCurrent = isWanted() && read.size > 0
 
     if (isCurrent) {
       model = { ...model, bodies: new Map([...model.bodies, ...read]) }
@@ -276,21 +396,19 @@ export function register(on: On) {
       return
     }
 
-    void pinned
-      .headKeyOf()
-      .catch(() => '')
-      .then(key => {
-        const isFirst = backend === pinned && polled.headKey === ''
+    const owner = lifecycle.owner()
+    void lifecycle.run('head', owner, async () => {
+      if (!isPaneOpen || backend !== pinned || polled.headKey !== '') return
+      const key = await pinned.headKeyOf().catch(() => '')
+      const isFirst = lifecycle.isCurrent(owner) && backend === pinned && polled.headKey === ''
 
-        if (isFirst) {
-          polled.headKey = key
-        }
-      })
+      if (isFirst) {
+        polled.headKey = key
+      }
+    }).catch(() => undefined)
   }
 
   function startPoll(engine: Host, pinned: Backend.Backend) {
-    const readHeadKey = () => pinned.headKeyOf().catch(() => '')
-
     if (polled.toplevel === pinned.repository.toplevel) {
       return
     }
@@ -302,11 +420,16 @@ export function register(on: On) {
     timers.set(
       'poll',
       engine.every(Limits.HEAD_POLL_MS, () => {
-        if (!isPaneOpen) {
+        if (!isPaneOpen || backend !== pinned || lifecycle.busy('head')) {
           return
         }
 
-        void readHeadKey().then(key => {
+        const owner = lifecycle.owner()
+        void lifecycle.run('head', owner, async () => {
+          if (!isPaneOpen || backend !== pinned) return
+          const key = await pinned.headKeyOf().catch(() => '')
+          if (!lifecycle.isCurrent(owner) || !isPaneOpen || backend !== pinned) return
+
           const hasMoved = polled.headKey !== '' && key !== polled.headKey
 
           polled.headKey = key
@@ -314,79 +437,113 @@ export function register(on: On) {
           if (hasMoved) {
             scheduleRefresh(engine)
           }
-        })
+        }).catch(() => undefined)
       }),
     )
   }
 
-  async function refresh(engine: Host): Promise<void> {
-    if (isRefreshing) {
-      isRefreshQueued = true
-
-      return
+  async function readOf(
+    engine: Host,
+    pinned: Backend.Backend | null,
+    waitForCompletion = false,
+  ): Promise<PaneState.Fetched | null> {
+    const owner = lifecycle.owner()
+    const mode = model.requestedMode
+    if (!(await waitForSessionStart(engine, owner))) {
+      return null
     }
-
-    isRefreshing = true
-
-    const record = Record.recorderOf(engine)
-    const pinned = backend
 
     const fetched = (): Promise<Git.FetchOutcome> =>
       pinned
-        ? pinned.fetchDiff(model.requestedMode)
+        ? pinned.fetchDiff(mode)
         : Promise.resolve({ kind: 'no-repository' })
 
-    try {
-      model = { ...model, isLoading: model.data === null }
-
+    return lifecycle.run('read', owner, async () => {
       const [outcome, messages] = await Promise.all([
         fetched(),
         engine.messages().catch((): SessionMessage[] => []),
       ])
+      return { outcome, messages }
+    }, waitForCompletion)
+  }
 
-      model = PaneState.afterFetch(model, { outcome, messages })
+  async function refresh(
+    engine: Host,
+    read: PaneState.Fetched | null = null,
+  ): Promise<void> {
+    const owner = lifecycle.owner()
+    requestSessionConfirmation(engine)
+    if (lifecycle.busy('refresh')) {
+      queuedRefresh = {
+        owner, engine,
+        read: read ?? (queuedRefresh?.owner === owner ? queuedRefresh.read : null),
+      }
 
-      switch (outcome.kind) {
-        case 'no-repository':
-          break
-        case 'unavailable':
+      return
+    }
+
+    const record = Record.recorderOf(engine)
+
+    await lifecycle.run('refresh', owner, async () => {
+      try {
+        if (!backend && !pin.isEmpty && !(await pinBackend(engine))) return
+        if (!lifecycle.isCurrent(owner)) return
+        const pinned = backend
+        model = { ...model, isLoading: model.data === null }
+
+        const fetched = read ?? (await readOf(engine, pinned, true))
+
+        if (!fetched) return
+
+        const { outcome } = fetched
+
+        if (outcome.kind === 'unavailable') {
           record.mark(Record.FEATURES.read, {
             kind: 'sad',
             reason: 'git_diff_failed',
           })
+        }
 
-          break
-        case 'data':
-          generation += 1
+        if (!lifecycle.isCurrent(owner)) return
 
-          break
+        model = PaneState.afterFetch(model, fetched)
+
+        switch (outcome.kind) {
+          case 'no-repository':
+          case 'unavailable':
+            break
+          case 'data':
+            generation += 1
+            break
+        }
+
+        const hasHunksFailed = await loadBodies(engine)
+
+        if (outcome.kind === 'data' && (hasHunksFailed || lifecycle.isCurrent(owner))) {
+          record.mark(
+            Record.FEATURES.read,
+            hasHunksFailed
+              ? { kind: 'sad', reason: 'git_hunks_failed' }
+              : { kind: 'ok' },
+          )
+        }
+      } catch (error) {
+        if (lifecycle.isCurrent(owner)) {
+          record.mark(Record.FEATURES.read, {
+            kind: 'sad', reason: 'git_diff_threw',
+          })
+        }
+        throw error
+      } finally {
+        if (lifecycle.isCurrent(owner)) redraw(engine)
       }
+    })
 
-      const hasHunksFailed = await loadBodies(engine)
-
-      if (outcome.kind === 'data') {
-        record.mark(
-          Record.FEATURES.read,
-          hasHunksFailed
-            ? { kind: 'sad', reason: 'git_hunks_failed' }
-            : { kind: 'ok' },
-        )
-      }
-    } catch (error) {
-      record.mark(Record.FEATURES.read, {
-        kind: 'sad',
-        reason: 'git_diff_threw',
-      })
-
-      throw error
-    } finally {
-      isRefreshing = false
-      redraw(engine)
-
-      if (isRefreshQueued) {
-        isRefreshQueued = false
-        scheduleRefresh(engine)
-      }
+    if (lifecycle.isCurrent(owner) && queuedRefresh?.owner === owner) {
+      const queued = queuedRefresh
+      queuedRefresh = null
+      if (queued.read) void refresh(queued.engine, queued.read).catch(() => undefined)
+      else scheduleRefresh(queued.engine)
     }
   }
 
@@ -402,22 +559,44 @@ export function register(on: On) {
     )
   }
 
-  async function markShown(
+  function openPane(
     engine: Host,
     trigger: (typeof Record.SHOWN_TRIGGERS)[number],
-  ): Promise<void> {
-    const sessionId = await engine.sessionId().catch(() => null)
-
-    if (sessionId !== null && sessionId !== shownSessionId) {
-      shownSessionId = sessionId
-      Record.recorderOf(engine).shown(trigger, Record.widthBucketOf(columns))
+    read: PaneState.Fetched | null = null,
+  ): Promise<boolean> {
+    const { epoch } = pin
+    const closes = [...paneOperations.closes]
+    opens += 1
+    paneOperations.revision += 1
+    if (paneOperations.tail !== null || closes.length > 0) {
+      engine.uiLog('The diff panel is waiting for an earlier pane operation to finish.')
     }
+
+    const opening = queuePane(async () => {
+      if (epoch !== pin.epoch || isPaneUnknown) {
+        return false
+      }
+
+      return isPaneOpen || placePane(engine, trigger, read, closes)
+    })
+
+    openingPane = opening
+
+    return opening.finally(() => {
+      if (openingPane === opening) {
+        openingPane = null
+      }
+    })
   }
 
-  async function openPane(
+  async function placePane(
     engine: Host,
     trigger: (typeof Record.SHOWN_TRIGGERS)[number],
+    read: PaneState.Fetched | null,
+    closes: readonly Promise<boolean>[],
   ): Promise<boolean> {
+    const { epoch } = pin
+    const owner = lifecycle.owner()
     const isDialog = model.isFullscreen === false
 
     model = {
@@ -431,17 +610,58 @@ export function register(on: On) {
 
     const landedBefore = landed
 
-    if (!isDialog) {
+    if (read) {
+      model = PaneState.afterFetch(model, read)
+    } else if (!isDialog) {
       await refresh(engine).catch(() => undefined)
     }
 
-    const opened = await engine.openPane(
-      isDialog
-        ? { ...dialogPane(), focus: true }
-        : { id: Names.PANE_ID, title: Names.PANE_TITLE },
-    )
+    await Promise.allSettled(closes)
+    if (epoch !== pin.epoch) {
+      return false
+    }
 
-    const isWaiting = isRecord(opened) && opened.isPlaced === false
+    const closesAtOpen = paneCloses
+    let isWaiting = false
+
+    try {
+      const opened = await engine.openPane(
+        isDialog
+          ? { ...dialogPane(), focus: true }
+          : { id: Names.PANE_ID, title: Names.PANE_TITLE },
+      )
+
+      isWaiting = isRecord(opened) && opened.isPlaced === false
+    } catch (error) {
+      if (!(await isPlacedAfterRejection(engine, error, epoch, closesAtOpen, trigger))) {
+        return false
+      }
+    }
+
+    if (epoch !== pin.epoch) {
+      const closedBefore = paneCloses
+
+      try {
+        await engine.closePane({ id: Names.PANE_ID })
+      } catch (error) {
+        engine.uiLog(
+          `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(error))}`,
+        )
+
+        if (!isWaiting && paneCloses === closedBefore) {
+          isPaneOpen = true
+          paneTrigger = trigger
+          void recordShown(engine)
+          await pinBackend(engine).catch(() => false)
+
+          if (isPaneOpen) {
+            await refresh(engine).catch(() => undefined)
+          }
+        }
+      }
+
+      return isPaneOpen
+    }
 
     if (isWaiting) {
       await engine.closePane({ id: Names.PANE_ID }).catch(() => undefined)
@@ -451,21 +671,164 @@ export function register(on: On) {
 
     isPaneOpen = true
     keepBaseline()
+    paneTrigger = trigger
+    void recordShown(engine)
 
-    await markShown(engine, trigger)
-
-    const isStale = isDialog || landed !== landedBefore
+    const isStale = isDialog || read !== null || landed !== landedBefore
 
     if (isStale) {
-      void refresh(engine)
+      void refresh(engine, read)
     }
 
     return true
   }
 
-  async function closePane(engine: Host): Promise<void> {
-    await engine.closePane({ id: Names.PANE_ID })
-    isPaneOpen = false
+  async function paneOf(engine: Host): Promise<PaneLookup> {
+    let panes: unknown
+
+    try {
+      panes = await engine.panes()
+    } catch (error) {
+      return { kind: 'unknown', reason: messageOf(error) }
+    }
+
+    if (!Array.isArray(panes)) {
+      return { kind: 'unknown', reason: 'the engine listed no panes' }
+    }
+
+    const pane = panes
+      .filter(isRecord)
+      .find(listed => listed.id === Names.PANE_ID)
+
+    if (!pane) {
+      return { kind: 'absent' }
+    }
+
+    return typeof pane.isPlaced === 'boolean'
+      ? { kind: pane.isPlaced ? 'placed' : 'waiting' }
+      : { kind: 'unknown', reason: 'the engine did not say whether the diff panel is placed' }
+  }
+
+  async function isPlacedAfterRejection(
+    engine: Host,
+    error: unknown,
+    epoch: number,
+    closesAtOpen: number,
+    trigger: (typeof Record.SHOWN_TRIGGERS)[number],
+  ): Promise<boolean> {
+    const pane = epoch === pin.epoch ? await paneOf(engine) : null
+
+    if (pane === null || epoch !== pin.epoch) {
+      try {
+        await engine.closePane({ id: Names.PANE_ID })
+      } catch (closeError) {
+        engine.uiLog(
+          `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(closeError))}`,
+        )
+
+        if (paneCloses === closesAtOpen) {
+          isPaneUnknown = true
+        }
+      }
+
+      throw error
+    }
+
+    if (paneCloses !== closesAtOpen) {
+      throw error
+    }
+
+    const reason = Views.sanitizeName(messageOf(error))
+
+    switch (pane.kind) {
+      case 'absent':
+        throw error
+      case 'waiting':
+        await engine.closePane({ id: Names.PANE_ID }).catch(() => undefined)
+        throw error
+      case 'unknown':
+        isPaneUnknown = true
+        paneTrigger = trigger
+        engine.uiLog(
+          `Could not tell whether the diff panel opened: ${reason}; the pane lookup failed: ${Views.sanitizeName(pane.reason)}`,
+        )
+        return false
+      case 'placed':
+        engine.uiLog(`The diff panel opened, but opening it reported: ${reason}`)
+        return true
+    }
+  }
+
+  async function settleUnknownPane(engine: Host): Promise<void> {
+    const { epoch } = pin
+    const closedBefore = paneCloses
+    const opened = opens
+    const pane = await paneOf(engine)
+
+    if (!isPaneUnknown || epoch !== pin.epoch || paneCloses !== closedBefore || opens !== opened) {
+      return
+    }
+
+    if (pane.kind === 'unknown') {
+      engine.uiLog(
+        `Could not tell whether the diff panel is shown: ${Views.sanitizeName(pane.reason)}`,
+      )
+
+      return
+    }
+
+    isPaneUnknown = false
+    isPaneOpen = pane.kind === 'placed'
+
+    if (isPaneOpen) {
+      void recordShown(engine)
+    }
+
+    if (pane.kind === 'waiting') {
+      await closePane(engine, true).catch(() => undefined)
+    }
+  }
+
+  async function recordShown(engine: Host): Promise<void> {
+    const { epoch } = pin
+    const closedBefore = paneCloses
+    const trigger = paneTrigger
+
+    if (!isPaneOpen || trigger === null) {
+      return
+    }
+
+    const sessionId = await engine.sessionId().catch(() => null)
+
+    if (epoch !== pin.epoch || paneCloses !== closedBefore || !isPaneOpen) {
+      return
+    }
+
+    if (sessionId !== null && sessionId !== shownSessionId) {
+      shownSessionId = sessionId
+      Record.recorderOf(engine).shown(trigger, Record.widthBucketOf(columns))
+    }
+  }
+
+  async function closePane(engine: Host, isCleanup = false): Promise<boolean> {
+    const owner = lifecycle.owner()
+    const placements = paneOperations.tail
+    if (paneOperations.tail !== null) {
+      engine.uiLog('The diff panel is waiting for an earlier pane operation to finish.')
+    }
+    const closing = lifecycle.run(
+      isCleanup ? 'pane-cleanup' : 'pane-close', owner, async () => {
+        await placements?.catch(() => undefined)
+        if (!lifecycle.isSession(owner)) return false
+        await engine.closePane({ id: Names.PANE_ID })
+        paneOperations.revision += 1
+        isPaneOpen = false
+        isPaneUnknown = false
+        return true
+      }, true,
+    ).then(result => result ?? false)
+    paneOperations.closes.add(closing)
+    return closing.finally(() => { paneOperations.closes.delete(closing) })
   }
 
   function markTabSwitch(engine: Host, tab: (typeof Record.TABS)[number]) {
@@ -475,10 +838,77 @@ export function register(on: On) {
     })
   }
 
-  async function openOnFirstEdit(engine: Host): Promise<void> {
-    const isTaken = () => isPaneOpen || hasAutoOpened
+  const isTaken = () => isPaneOpen || hasAutoOpened || isPaneUnknown
 
-    if (isTaken()) {
+  const hasRoomFor = (floor: number) =>
+    model.isFullscreen === true && columns !== null && columns >= floor
+
+  async function openOnFetchedFiles(
+    engine: Host,
+    floor: number,
+  ): Promise<void> {
+    if (lifecycle.busy('auto')) {
+      return
+    }
+
+    const owner = lifecycle.owner()
+
+    await lifecycle.run('auto', owner, async () => {
+      while (lifecycle.isCurrent(owner) && !isTaken()) {
+        const seen = landed
+        const opened = opens
+        const read = await readOf(engine, backend)
+
+        if (!read) {
+          return
+        }
+
+        const isOvertaken = opened !== opens
+
+        const isCurrent =
+          lifecycle.isCurrent(owner) && !isOvertaken && hasRoomFor(floor) && !isTaken()
+
+        const isListing = isCurrent && PaneState.hasSessionFiles(read.outcome)
+
+        if (isListing) {
+          hasAutoOpened = true
+
+          let isPlaced = false
+
+          try {
+            isPlaced = await openPane(engine, 'auto_open', read)
+          } finally {
+            if (lifecycle.isCurrent(owner) && !isPlaced) {
+              hasAutoOpened = isPaneOpen
+            }
+          }
+
+          if (!lifecycle.isCurrent(owner) || !isPlaced) {
+            return
+          }
+        }
+
+        const hasLostRoom = !isListing && !hasRoomFor(floor)
+
+        if (seen === landed || isOvertaken || hasLostRoom) {
+          return
+        }
+
+        if (isListing) {
+          scheduleRefresh(engine)
+        }
+      }
+    })
+  }
+
+  async function openOnFirstEdit(
+    engine: Host,
+    path: string | null = null,
+  ): Promise<void> {
+    const { epoch } = pin
+    const isOvertaken = () => epoch !== pin.epoch || isTaken()
+
+    if (isOvertaken()) {
       return
     }
 
@@ -489,37 +919,45 @@ export function register(on: On) {
       ? Limits.OPEN_MIN_COLUMNS
       : Limits.AUTO_OPEN_MIN_COLUMNS
 
-    const hasRoom =
-      preference !== false &&
-      model.isFullscreen === true &&
-      columns !== null &&
-      columns >= floor
+    const hasRoom = preference !== false && hasRoomFor(floor)
 
-    if (!hasRoom || isTaken()) {
+    if (!hasRoom || isOvertaken()) {
       return
     }
 
     const isCheckpointed = await engine.isCheckpointing().catch(() => true)
 
-    if (!isCheckpointed || isTaken()) {
+    if (!isCheckpointed || isOvertaken()) {
       return
     }
 
     await pinBackend(engine)
 
-    if (!backend || isTaken()) {
+    if (!backend || isOvertaken()) {
       return
     }
 
-    hasAutoOpened = true
-    hasAutoOpened = await openPane(engine, 'auto_open')
+    const isOutside =
+      path !== null &&
+      isOutsideWorkingTree(path, {
+        cwd: pin.cwd,
+        toplevel: backend.repository.toplevel,
+      })
+
+    if (!isOutside) {
+      await openOnFetchedFiles(engine, floor)
+    }
   }
 
   async function openOnRestore(engine: Host): Promise<void> {
-    hasRestoredEdits =
-      Turns.turnDiffsOf(
-        await engine.messages().catch((): SessionMessage[] => []),
-      ).length > 0
+    const { epoch } = pin
+    const messages = await engine.messages().catch((): SessionMessage[] => [])
+
+    if (epoch !== pin.epoch) {
+      return
+    }
+
+    hasRestoredEdits = Turns.turnDiffsOf(messages).length > 0
 
     if (hasRestoredEdits) {
       await openOnFirstEdit(engine)
@@ -571,6 +1009,8 @@ export function register(on: On) {
         return
       }
 
+      lifecycle.advance(false)
+      queuedRefresh = null
       model = { ...model, requestedMode: mode }
 
       Record.recorderOf(engine).mark(Record.FEATURES.baseSwitch, {
@@ -634,7 +1074,30 @@ export function register(on: On) {
   async function startedAtOf(engine: Host): Promise<number | null> {
     const startedAt: unknown = await engine.startedAt().catch(() => undefined)
 
-    return typeof startedAt === 'number' ? startedAt : null
+    return typeof startedAt === 'number' && Number.isFinite(startedAt) ? startedAt : null
+  }
+
+  async function waitForSessionStart(
+    engine: Host,
+    owner: ReturnType<Lifecycle['owner']>,
+  ): Promise<boolean> {
+    if (sessionChange?.phase === 'initializing' && lifecycle.isSession(owner)) {
+      engine.uiLog('The diff panel is waiting for the active session timing and any unfinished pane operation.')
+    }
+    const ready = await lifecycle.untilChanged(owner, sessionStartReady)
+    return ready === true && lifecycle.isCurrent(owner)
+  }
+
+  async function resetSessionStart(engine: Host): Promise<void> {
+    const { epoch } = pin
+    const startedAt = await startedAtOf(engine)
+
+    if (epoch === pin.epoch) {
+      if (startedAt === null) {
+        throw new Error(Names.SESSION_TIMING_UNAVAILABLE_TEXT)
+      }
+      sessionStartMs = startedAt
+    }
   }
 
   async function bind(engine: Host, cwd: string): Promise<void> {
@@ -676,6 +1139,7 @@ export function register(on: On) {
         uiLog: text => $.ui.log(text),
         openPane: pane => $.ui.open(pane),
         closePane: pane => $.ui.close(pane),
+        panes: () => $.ui.panes(),
         registerCommand: spec => $.command.register(spec),
         sessionId: () => $.session.id(),
         startedAt: () =>
@@ -770,13 +1234,26 @@ export function register(on: On) {
       return next(e)
     }
 
-    const isAnswered = (await pinBackend(host)) || (await pinBackend(host))
+    const commandOwner = lifecycle.owner()
+    if (isPaneUnknown) {
+      await settleUnknownPane(host)
+      if (!lifecycle.isSession(commandOwner)) return { text: Names.SESSION_CHANGED_TEXT }
+      if (isPaneUnknown) return { text: Names.PANEL_STATE_UNKNOWN_TEXT }
+    }
+    if (!isPaneOpen) {
+      let isAnswered = await pinBackend(host)
+      if (!lifecycle.isSession(commandOwner)) return { text: Names.SESSION_CHANGED_TEXT }
+      if (!isAnswered) isAnswered = await pinBackend(host)
+      if (!lifecycle.isSession(commandOwner)) return { text: Names.SESSION_CHANGED_TEXT }
 
-    if (!backend) {
-      return {
-        text: isAnswered
-          ? Names.NOT_IN_REPOSITORY_TEXT
-          : Names.GIT_UNANSWERED_TEXT,
+      if (!backend) {
+        return {
+          text: sessionChange?.phase === 'unavailable'
+            ? Names.SESSION_TIMING_UNAVAILABLE_TEXT
+            : isAnswered
+            ? Names.NOT_IN_REPOSITORY_TEXT
+            : Names.GIT_UNANSWERED_TEXT,
+        }
       }
     }
 
@@ -795,13 +1272,20 @@ export function register(on: On) {
     }
 
     const isOpening = toggle === 'open'
+    const { epoch } = pin
 
     const isDone = isOpening
       ? await openPane(host, 'manual')
-      : await closePane(host).then(() => true)
+      : await closePane(host)
 
     if (!isDone) {
-      return { text: Names.RESIZE_TERMINAL_TEXT }
+      return {
+        text: epoch !== pin.epoch
+          ? Names.SESSION_CHANGED_TEXT
+          : isPaneUnknown
+          ? Names.PANEL_STATE_UNKNOWN_TEXT
+          : Names.RESIZE_TERMINAL_TEXT,
+      }
     }
 
     if (!isFullscreen) {
@@ -826,11 +1310,7 @@ export function register(on: On) {
       model = { ...model, dialogView: 'list' }
       redraw(host)
 
-      dialogRows = Views.dialogRowsOf(model)
-
-      void host
-        .openPane({ ...dialogPane(), focus: true })
-        .catch(() => undefined)
+      fitDialog(host, true)
 
       return { deny: 'back to the file list' }
     }
@@ -840,7 +1320,10 @@ export function register(on: On) {
     const isPersons = isClosed && e.origin.kind === 'person'
 
     if (isClosed) {
+      paneCloses += 1
       isPaneOpen = false
+      isPaneUnknown = false
+      paneTrigger = null
     }
 
     const isDocking = model.isFullscreen !== false
@@ -896,45 +1379,112 @@ export function register(on: On) {
     return {}
   })
 
-  on('command.run', { command: ['clear', 'resume'] }, async ($, e, next) => {
-    const result = await next(e)
-
-    if (!host) {
-      return result
-    }
-
-    const isResume = e.command === 'resume'
-    const isKeptOpen = isPaneOpen && !isResume
-
-    if (isPaneOpen && isResume) {
-      await closePane(host).catch(() => undefined)
-    }
-
+  function beginSessionChange(engine: Host, endedId: string, reason: 'clear' | 'resume') {
+    const previous = sessionChange
     unpin()
+    timers.get('refresh')?.cancel()
+    timers.delete('refresh')
+    queuedRefresh = null
     hasAutoOpened = false
     hasRestoredEdits = false
     bodyStamp = null
     bodyBase = null
     bodyLoads.clear()
-    disarm(host)
+    disarm(engine)
     model = PaneState.afterNewSession(model)
+    let release = (_ready: boolean) => {}
+    sessionStartReady = new Promise<boolean>(resolve => { release = resolve })
+    sessionChange = {
+      owner: lifecycle.owner(), endedId, reason, phase: 'pending',
+      requested: 0, attempted: 0, release,
+    }
+    previous?.release(false)
+  }
 
-    sessionStartMs =
-      (await startedAtOf(host)) ??
-      (isResume ? sessionStartMs : await host.now())
+  function requestSessionConfirmation(engine: Host) {
+    const change = sessionChange
+    if (!change || (change.phase !== 'pending' && change.phase !== 'unavailable')) return
+    change.requested += 1
+    confirmSessionChange(engine, change)
+  }
 
-    if (isKeptOpen) {
-      await markShown(host, 'manual')
-      await pinBackend(host)
-      keepBaseline()
-      void refresh(host)
+  function confirmSessionChange(engine: Host, change: SessionChange) {
+    if (change !== sessionChange || change.phase === 'ready' || change.phase === 'initializing' || lifecycle.busy('session')) return
+
+    if (change.phase === 'unavailable') {
+      sessionStartReady = new Promise<boolean>(resolve => { change.release = resolve })
+      change.phase = 'pending'
     }
 
-    if (isResume) {
-      void openOnRestore(host).catch(() => undefined)
-    }
+    void lifecycle.run('session', change.owner, async () => {
+      while (change === sessionChange && change.phase === 'pending') {
+        change.attempted = change.requested
+        const id = await engine.sessionId().catch(() => null)
+        if (!lifecycle.isSession(change.owner) || change !== sessionChange) return
 
-    return result
+        if (id === null || id === change.endedId) {
+          if (change.attempted !== change.requested) continue
+          engine.uiLog('The diff panel is waiting for the active session to be confirmed.')
+          return
+        }
+
+        change.phase = 'initializing'
+        const starting = resetSessionStart(engine)
+        void starting.catch(() => undefined)
+
+        if ((isPaneOpen || isPaneUnknown) && change.reason === 'resume') {
+          try {
+            await closePane(engine, true)
+          } catch (error) {
+            engine.uiLog(
+              `Could not close the diff panel after the session changed: ${Views.sanitizeName(messageOf(error))}`,
+            )
+          }
+        }
+
+        await starting
+        if (!lifecycle.isSession(change.owner) || change !== sessionChange) return
+        change.phase = 'ready'
+        change.release(true)
+
+        if (isPaneOpen) {
+          if (change.reason === 'clear') paneTrigger = 'manual'
+          void recordShown(engine)
+          await pinBackend(engine)
+          if (lifecycle.isSession(change.owner) && isPaneOpen) {
+            keepBaseline()
+            void refresh(engine)
+          }
+        }
+        if (lifecycle.isSession(change.owner) && change.reason === 'resume') {
+          void openOnRestore(engine).catch(() => undefined)
+        }
+      }
+    }).catch(error => {
+      if (change !== sessionChange) return
+      change.phase = 'unavailable'
+      change.release(false)
+      engine.uiLog(`Could not initialize the diff session: ${Views.sanitizeName(messageOf(error))}`)
+    }).finally(() => {
+      if ((change.phase === 'pending' || change.phase === 'unavailable') && change.attempted !== change.requested) {
+        confirmSessionChange(engine, change)
+      }
+    })
+  }
+
+  on('session.end', ($, e, next) => {
+    if (host && (e.reason === 'clear' || e.reason === 'resume')) {
+      beginSessionChange(host, e.sessionId, e.reason)
+    }
+    return next(e)
+  })
+
+  on('command.run', { command: ['clear', 'resume'] }, async ($, e, next) => {
+    try {
+      return await next(e)
+    } finally {
+      if (host) requestSessionConfirmation(host)
+    }
   })
 
   function afterTool(
@@ -963,13 +1513,18 @@ export function register(on: On) {
     const isMainLoopEdit = hasEdited && e.agentId === undefined
 
     if (isMainLoopEdit) {
-      void openOnFirstEdit(engine).catch(() => undefined)
+      void openOnFirstEdit(engine, Tools.editedPathOf(e)).catch(() => undefined)
     }
   }
 
   on(
     'tool.call',
-    { tool: [...Tools.EDITING_TOOLS, ...Tools.SHELL_TOOLS] },
+    {
+      tool: [
+        ...Tools.EDITING_TOOLS,
+        ...Tools.SHELL_TOOLS.map(name => new RegExp('^' + name + '$')),
+      ],
+    },
     async ($, e, next) => {
       let result: ResultOf['tool.call'] | undefined
 

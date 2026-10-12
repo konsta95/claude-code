@@ -9,6 +9,7 @@ import type {
   ProcessRunResult,
   SessionMessage,
   TimerCall,
+  UiPane,
 } from 'claude-code'
 
 /**
@@ -99,6 +100,12 @@ export type Host = {
    * `$.ui.close`.
    */
   closePane: (pane: PaneCloseArgs) => Promise<void>
+
+  /**
+   * `$.ui.panes`: the engine's record of the plugin's open panes, not the
+   * module's.
+   */
+  panes: () => Promise<readonly UiPane[]>
 
   /**
    * `$.command.register`; rejects while another `/diff` is listed.

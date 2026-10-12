@@ -12,17 +12,20 @@ import { withClosingLine } from './with-closing-line'
  *
  * A row with no body (untracked, binary, renamed, or staged then edited on
  * an unborn HEAD) is never named to git. Paths past MAX_PATHSPEC_CHARS and
- * files a cut answer left unread go to a further child.
+ * files a cut answer left unread go to a further child, unless the read is
+ * no longer wanted: then no child starts and they are left out.
  *
  * @param run runs git against the pinned repository
  * @param data the fetch the rows belong to
  * @param files the rows
+ * @param isWanted whether the read's answer can still be used
  * @returns each row's parsed body by path, null where git failed
  */
 export async function fetchHunks(
   run: Types.GitRun,
   data: Types.DiffData,
   files: readonly Types.FileStat[],
+  isWanted: () => boolean = () => true,
 ): Promise<ReadonlyMap<string, Types.FileHunks | null>> {
   const bodied = files.filter(
     file =>
@@ -36,7 +39,7 @@ export async function fetchHunks(
     .filter(file => !bodied.includes(file))
     .map(file => [file.path, EMPTY_FILE_HUNKS] as const)
 
-  if (bodied.length === 0) {
+  if (bodied.length === 0 || !isWanted()) {
     return new Map(bodiless)
   }
 
@@ -70,7 +73,7 @@ export async function fetchHunks(
 
   const rest = isStuck
     ? waiting.map(file => [file.path, null] as const)
-    : await fetchHunks(run, data, waiting)
+    : await fetchHunks(run, data, waiting, isWanted)
 
   return new Map<string, Types.FileHunks | null>([
     ...bodiless,

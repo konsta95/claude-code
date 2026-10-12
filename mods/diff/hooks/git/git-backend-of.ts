@@ -69,7 +69,7 @@ export async function gitBackendOf(
 
       return fetchDiff(depsOf(await baseline), mode)
     },
-    fetchHunks: (data, files) => fetchHunks(run, data, files),
+    fetchHunks: (data, files, isWanted) => fetchHunks(run, data, files, isWanted),
     headKeyOf: () =>
       Probes.headKeyOf(
         { ...depsOf(null), readFile: host.readFile },

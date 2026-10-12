@@ -31,11 +31,13 @@ export type Backend = {
 
   /**
    * The rows' hunks by path against the base their fetch read, null where
-   * they could not be read (Git.fetchHunks).
+   * they could not be read; git is asked no more once the read is no longer
+   * wanted (Git.fetchHunks).
    */
   fetchHunks: (
     data: Git.DiffData,
     files: readonly Git.FileStat[],
+    isWanted?: () => boolean,
   ) => Promise<ReadonlyMap<string, Git.FileHunks | null>>
 
   /**
